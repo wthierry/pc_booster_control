@@ -1,0 +1,19 @@
+[Unit]
+Description=Booster K1 Camera Web Server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=booster
+Group=booster
+WorkingDirectory=/home/booster/pc_booster_control
+ExecStart=/home/booster/pc_booster_control/scripts/run_web_server.sh
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=15
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

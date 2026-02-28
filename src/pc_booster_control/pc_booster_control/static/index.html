@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Booster K1 Camera Viewer</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="layout">
+      <section class="panel">
+        <div class="topbar">
+          <h1>Booster K1 Camera Viewer</h1>
+          <div class="topbar-right">
+            <div id="audioWidget" class="audio-indicator" title="System microphone activity">
+              <div class="audio-bars" aria-hidden="true">
+                <span class="bar"></span>
+                <span class="bar"></span>
+                <span class="bar"></span>
+              </div>
+              <span id="audioText">Mic idle</span>
+            </div>
+            <div id="batteryWidget" class="battery">
+              <span id="batteryText">--%</span>
+              <div class="battery-shell">
+                <div id="batteryFill" class="battery-fill"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <p id="status" class="status">Checking camera connection...</p>
+        <p id="batteryAlert" class="battery-alert" aria-live="polite"></p>
+
+        <div class="streams" id="streamsGrid">
+          <div class="stream-card">
+            <h2>Color Camera</h2>
+            <img class="stream-image" id="colorStream" src="/stream/color" alt="Color stream" />
+          </div>
+        </div>
+        <h2>Debug</h2>
+        <pre id="output"></pre>
+        <h2>Robot Command</h2>
+        <div class="command-row">
+          <input id="cmdInput" type="text" placeholder="Type command to run on robot (e.g. ros2 topic list)" />
+          <button id="cmdRunBtn">Run</button>
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2>Safety Mode</h2>
+        <p>This interface is camera-only. No motion or head-control commands are exposed.</p>
+        <h2>Robot Mode</h2>
+        <div class="row">
+          <button id="dampBtn" disabled>DAMP</button>
+          <button id="prepBtn">PREP</button>
+        </div>
+        <h2>Microphone</h2>
+        <label class="inline-check">
+          <input id="micToggle" type="checkbox" />
+          Enable microphone
+        </label>
+        <h2>Text To Speech</h2>
+        <p id="speakReady" class="status">Initializing Piper...</p>
+        <label for="voiceType">Voice</label>
+        <select id="voiceType">
+          <option value="en_US-lessac-medium" selected>English (Piper Lessac Medium)</option>
+          <option value="custom">Custom voice model id...</option>
+        </select>
+        <input id="customVoice" type="text" placeholder="Custom model id (e.g. en_US-lessac-medium)" style="display:none;" />
+        <label for="speakText">Speak Text</label>
+        <textarea id="speakText" rows="3" placeholder="Type text for Booster to say..."></textarea>
+        <button id="speakBtn">Speak</button>
+        <h2>Volume</h2>
+        <label for="volumeSlider">Speaker Volume: <span id="volumeText">--%</span></label>
+        <input id="volumeSlider" type="range" min="0" max="100" step="1" value="60" />
+        <h2>Motors</h2>
+        <p id="motorsStatus" class="status">Loading motor telemetry...</p>
+        <div class="motors-wrap">
+          <table class="motors-table">
+            <thead>
+              <tr>
+                <th>Motor</th>
+                <th>Pos (rad)</th>
+                <th>Temp (C)</th>
+              </tr>
+            </thead>
+            <tbody id="motorsTableBody"></tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>

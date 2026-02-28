@@ -1,0 +1,20 @@
+#!/usr/bin/expect -f
+set timeout -1
+set host "192.168.5.149"
+set user "booster"
+set pass "123456"
+set logfile "/Users/wthierry/Development/pc_booster_control/battery_monitor.log"
+
+log_file -a $logfile
+puts "=== monitor start [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}] ==="
+spawn ssh -o ConnectTimeout=5 $user@$host
+expect {
+  "*yes/no*" { send "yes\r"; exp_continue }
+  "*password:*" { send "$pass\r" }
+  timeout { puts "SSH connect timeout"; exit 1 }
+}
+
+send -- "while true; do ts=\\$(date '+%Y-%m-%d %H:%M:%S'); cap=\\$(cat /sys/class/power_supply/battery/capacity 2>/dev/null); cc=\\$(cat /sys/class/power_supply/battery/charge_counter 2>/dev/null); cfd=\\$(cat /sys/class/power_supply/battery/charge_full_design 2>/dev/null); st=\\$(cat /sys/class/power_supply/battery/status 2>/dev/null); v=\\$(cat /sys/class/power_supply/battery/voltage_now 2>/dev/null); pct=\\$cap; if [ -n \"\\$cc\" ] && [ -n \"\\$cfd\" ] && [ \"\\$cfd\" -gt 0 ] 2>/dev/null; then pct=\\$((100*cc/cfd)); fi; echo \"\\$ts cap=\\$cap derived_pct=\\$pct status=\\$st voltage_now=\\$v charge_counter=\\$cc charge_full_design=\\$cfd\"; sleep 5; done\r"
+
+expect eof
+puts "=== monitor end [clock format [clock seconds] -format {%Y-%m-%d %H:%M:%S}] ==="
