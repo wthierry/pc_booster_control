@@ -6,3 +6,8 @@ __pycache__/
 *.pid
 *.nohup
 .DS_Store
+src/booster_robotics_sdk/
+.env
+
+# Local Piper model binaries
+piper/voices/*.onnx

@@ -1,0 +1,19 @@
+[Unit]
+Description=Booster K1 Conversation Daemon (Wake Word + STT + Piper)
+After=network-online.target pc_booster_web.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=booster
+Group=booster
+WorkingDirectory=/home/booster/pc_booster_control
+ExecStart=/home/booster/pc_booster_control/scripts/run_conversation_daemon.sh
+Restart=always
+RestartSec=2
+KillSignal=SIGINT
+TimeoutStopSec=15
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

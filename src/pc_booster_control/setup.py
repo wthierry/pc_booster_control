@@ -27,6 +27,7 @@ setup(
     entry_points={
         "console_scripts": [
             "booster_web = pc_booster_control.web_server:main",
+            "booster_conversation = pc_booster_control.conversation_daemon:main",
         ],
     },
 )

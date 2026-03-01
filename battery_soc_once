@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+BIN_CANDIDATES=(
+  "/home/booster/Workspace/booster_robotics_sdk/build/battery_state_subscriber"
+  "/home/booster/booster_robotics_sdk/build/battery_state_subscriber"
+)
+
+BIN=""
+for c in "${BIN_CANDIDATES[@]}"; do
+  if [[ -x "$c" ]]; then
+    BIN="$c"
+    break
+  fi
+done
+
+if [[ -z "$BIN" ]]; then
+  echo "battery_state_subscriber binary not found" >&2
+  exit 1
+fi
+
+export FASTRTPS_DEFAULT_PROFILES_FILE="${FASTRTPS_DEFAULT_PROFILES_FILE:-/opt/booster/BoosterRos2/fastdds_profile.xml}"
+export LD_LIBRARY_PATH="/home/booster/booster_robotics_sdk/lib/aarch64:/home/booster/booster_robotics_sdk/third_party/lib/aarch64:${LD_LIBRARY_PATH:-}"
+
+RAW="$(timeout 5 stdbuf -oL -eL "$BIN" 2>/dev/null || true)"
+SOC="$(printf '%s\n' "$RAW" | awk '/SOC[[:space:]]*:/ {gsub(/[^0-9.]/, "", $0); if ($0 != "") {print $0; exit}}')"
+
+if [[ -z "$SOC" ]]; then
+  echo "failed to parse SOC from battery subscriber output" >&2
+  exit 1
+fi
+
+python3 - "$SOC" <<'PY'
+import sys
+try:
+    v = float(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+print(int(round(v)))
+PY

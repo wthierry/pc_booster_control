@@ -1,5 +1,7 @@
 import os
 import shlex
+import shutil
+import ssl
 import subprocess
 import threading
 import time
@@ -7,15 +9,43 @@ import re
 import json
 import struct
 import tempfile
+import base64
 from collections import deque
 from pathlib import Path
 from typing import Any
+from urllib import error as urlerror
+from urllib import request as urlrequest
 
 import uvicorn
 from fastapi import FastAPI, Query
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.staticfiles import StaticFiles
+
+
+def _preload_env_file() -> None:
+    env_path = Path(__file__).resolve().parents[3] / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                val = val[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except Exception:
+        return
+
+
+_preload_env_file()
 
 ROS_IMPORT_ERROR: str | None = None
 ROS_AVAILABLE = True
@@ -32,6 +62,28 @@ except Exception as exc:  # pragma: no cover - runtime environment dependent
     RosWebBridge = Any  # type: ignore[misc,assignment]
 
 
+def _resolve_default_piper_bin() -> Path:
+    in_path = shutil.which("piper")
+    if in_path:
+        return Path(in_path)
+    for candidate in (
+        "/opt/homebrew/bin/piper",
+        "/usr/local/bin/piper",
+        "/home/booster/piper/piper/piper",
+    ):
+        path = Path(candidate)
+        if path.exists():
+            return path
+    return Path("/home/booster/piper/piper/piper")
+
+
+def _resolve_default_piper_voice_dir() -> Path:
+    local_voice_dir = Path(__file__).resolve().parents[3] / "piper" / "voices"
+    if local_voice_dir.exists():
+        return local_voice_dir
+    return Path("/home/booster/piper/voices")
+
+
 DEFAULT_COLOR_TOPIC = os.environ.get("BOOSTER_COLOR_TOPIC", "/StereoNetNode/rectified_image")
 DEFAULT_DEPTH_TOPIC = os.environ.get("BOOSTER_DEPTH_TOPIC", "/StereoNetNode/stereonet_depth")
 BATTERY_SYSFS_DIR = Path("/sys/class/power_supply/battery")
@@ -45,10 +97,27 @@ DAMP_MODE_VALUE = int(os.environ.get("BOOSTER_MODE_DAMP", "0"))
 PREP_MODE_VALUE = int(os.environ.get("BOOSTER_MODE_PREP", "1"))
 DEBUG_LOG_MAX_LINES = int(os.environ.get("BOOSTER_DEBUG_LOG_MAX_LINES", "1200"))
 BASHRC_PATH = Path(os.environ.get("BOOSTER_BASHRC_PATH", str(Path.home() / ".bashrc")))
-PIPER_BIN = Path(os.environ.get("BOOSTER_PIPER_BIN", "/home/booster/piper/piper/piper"))
-PIPER_VOICE_DIR = Path(os.environ.get("BOOSTER_PIPER_VOICE_DIR", "/home/booster/piper/voices"))
+PIPER_BIN = Path(os.environ.get("BOOSTER_PIPER_BIN", str(_resolve_default_piper_bin())))
+PIPER_VOICE_DIR = Path(os.environ.get("BOOSTER_PIPER_VOICE_DIR", str(_resolve_default_piper_voice_dir())))
 DEFAULT_PIPER_VOICE = os.environ.get("BOOSTER_PIPER_DEFAULT_VOICE", "en_US-lessac-medium")
 PIPER_APLAY_DEVICE = os.environ.get("BOOSTER_PIPER_APLAY_DEVICE", "plughw:CARD=Device,DEV=0")
+PIPER_PLAYBACK_MODE = os.environ.get("BOOSTER_PIPER_PLAYBACK_MODE", "auto").strip().lower()
+PIPER_LENGTH_SCALE = os.environ.get("BOOSTER_PIPER_LENGTH_SCALE", "").strip()
+PIPER_ESPEAK_VOICE = os.environ.get("BOOSTER_PIPER_ESPEAK_VOICE", "").strip()
+OPENAI_API_URL = os.environ.get("BOOSTER_OPENAI_API_URL", "https://api.openai.com/v1/responses")
+OPENAI_MODEL = os.environ.get("BOOSTER_OPENAI_MODEL", "gpt-4.1-mini")
+OPENAI_TIMEOUT_SEC = int(os.environ.get("BOOSTER_OPENAI_TIMEOUT_SEC", "60"))
+OPENAI_KEY_NAMES = ("OPENAI_API_KEY", "CHATGPT_API_KEY", "CHAT_GPT_API", "API_KEY")
+DEFAULT_SYSTEM_PROMPT = (
+    "You are Booster K1's onboard assistant. Keep responses concise, practical, and lightly witty."
+)
+CONVERSATION_ENABLED = os.environ.get("BOOSTER_CONVERSATION_ENABLED", "0").strip() not in ("0", "false", "False")
+_audio_activity_default = "0" if CONVERSATION_ENABLED else "1"
+AUDIO_ACTIVITY_ENABLED = os.environ.get("BOOSTER_AUDIO_ACTIVITY_ENABLED", _audio_activity_default).strip() not in (
+    "0",
+    "false",
+    "False",
+)
 
 # From Booster SDK b1_api_const.hpp::JointIndex (kJointCnt = 23)
 B1_JOINT_NAMES: list[str] = [
@@ -135,6 +204,7 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 @app.on_event("startup")
 def _startup() -> None:
     _debug_log("web server startup")
+    _load_env_file()
     if ROS_AVAILABLE:
         rclpy.init(args=None)
         bridge = RosWebBridge(color_topic=DEFAULT_COLOR_TOPIC, depth_topic=DEFAULT_DEPTH_TOPIC)
@@ -149,17 +219,17 @@ def _startup() -> None:
         state.executor = executor
         state.spin_thread = spin_thread
 
-    piper_ready, piper_error = _piper_ready_state()
-    state.ai_chat_initialized = piper_ready
-    state.ai_chat_ready = piper_ready
+    speech_ready, speech_error, speech_voice = _speech_ready_state()
+    state.ai_chat_initialized = speech_ready
+    state.ai_chat_ready = speech_ready
     state.ai_chat_starting = False
-    state.ai_chat_error = piper_error
-    state.ai_voice_type = DEFAULT_PIPER_VOICE if piper_ready else None
+    state.ai_chat_error = speech_error
+    state.ai_voice_type = speech_voice
     state.mic_enabled = False
-    if piper_ready:
-        _debug_log(f"piper ready: {DEFAULT_PIPER_VOICE}")
+    if speech_ready:
+        _debug_log(f"speech pipeline ready: model={OPENAI_MODEL}, voice={speech_voice}")
     else:
-        _debug_log(f"piper unavailable: {piper_error}")
+        _debug_log(f"speech pipeline unavailable: {speech_error}")
 
 
 @app.on_event("shutdown")
@@ -196,7 +266,7 @@ def health() -> dict[str, Any]:
         volume_percent = volume_bashrc_default
         volume_source = "bashrc:vol_default"
 
-    piper_ready, piper_error = _piper_ready_state()
+    speech_ready, speech_error, speech_voice = _speech_ready_state()
     return {
         "ok": True,
         "ros_available": ROS_AVAILABLE,
@@ -211,10 +281,10 @@ def health() -> dict[str, Any]:
         "volume_percent": volume_percent,
         "volume_source": volume_source,
         "volume_bashrc_default": volume_bashrc_default,
-        "ai_ready": piper_ready,
+        "ai_ready": speech_ready,
         "ai_starting": False,
-        "ai_error": piper_error,
-        "ai_voice_type": DEFAULT_PIPER_VOICE if piper_ready else None,
+        "ai_error": speech_error,
+        "ai_voice_type": speech_voice,
         "mic_enabled": False,
         "motors_count": len(state.motors_cache),
         "motors_error": state.motors_cache_error,
@@ -224,6 +294,11 @@ def health() -> dict[str, Any]:
             "change_mode_api_id": CHANGE_MODE_API_ID,
             "damp_value": DAMP_MODE_VALUE,
             "prep_value": PREP_MODE_VALUE,
+        },
+        "tts_control": {
+            "piper_length_scale": PIPER_LENGTH_SCALE or None,
+            "piper_espeak_voice": PIPER_ESPEAK_VOICE or None,
+            "piper_playback_mode": PIPER_PLAYBACK_MODE,
         },
     }
 
@@ -286,16 +361,65 @@ def set_mode(target: str) -> dict[str, Any]:
 
 @app.post("/api/speak")
 def speak(req: SpeakRequest) -> dict[str, Any]:
-    text = req.text.strip()
-    if not text:
+    user_text = req.text.strip()
+    if not user_text:
         return {"ok": False, "error": "text is empty"}
 
+    _load_env_file()
+    api_key = _resolve_openai_api_key()
+    if not api_key:
+        return {
+            "ok": False,
+            "error": "OpenAI API key missing (set OPENAI_API_KEY or CHATGPT_API_KEY in .env/environment)",
+        }
+
+    system_prompt = os.environ.get("CHATGPT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip() or DEFAULT_SYSTEM_PROMPT
+    assistant_text, llm_error = _query_openai_response(
+        api_key=api_key,
+        prompt=user_text,
+        system_prompt=system_prompt,
+        model=OPENAI_MODEL,
+    )
+    if llm_error:
+        _debug_log(f"openai query failed: {llm_error}")
+        return {"ok": False, "error": f"OpenAI error: {llm_error}"}
+
+    if not assistant_text:
+        return {"ok": False, "error": "OpenAI returned empty response"}
+
+    tts_text = _prepare_tts_text(assistant_text)
     voice = (req.voice_type or "").strip() or DEFAULT_PIPER_VOICE
-    ok, error, voice_id = _speak_with_piper(text, voice)
+    ok, error, voice_id, audio_b64, playback_mode = _speak_with_piper(tts_text, voice)
     if not ok:
         _debug_log(f"piper speak failed: {error}")
-        return {"ok": False, "error": error, "voice_used": voice_id}
-    return {"ok": True, "voice_used": voice_id}
+        return {
+            "ok": False,
+            "error": error,
+            "voice_used": voice_id,
+            "assistant_text": assistant_text,
+            "tts_text": tts_text,
+            "playback_mode": playback_mode,
+        }
+    return {
+        "ok": True,
+        "voice_used": voice_id,
+        "assistant_text": assistant_text,
+        "tts_text": tts_text,
+        "user_text": user_text,
+        "playback_mode": playback_mode,
+        "audio_mime": "audio/wav" if audio_b64 else None,
+        "audio_base64": audio_b64,
+    }
+
+
+@app.get("/api/voices")
+def voices() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "voice_dir": str(PIPER_VOICE_DIR),
+        "default_voice": DEFAULT_PIPER_VOICE,
+        "voices": _list_piper_voice_ids(),
+    }
 
 
 @app.get("/api/volume")
@@ -399,6 +523,9 @@ def _read_motors_cached() -> tuple[list[dict[str, Any]] | None, str, str | None]
 
 
 def _read_motors_once() -> tuple[list[dict[str, Any]] | None, str, str | None]:
+    if not _ros2_cli_ready():
+        return None, "/low_state", "ROS2 CLI unavailable on this host"
+
     cmd = (
         "source /opt/ros/humble/setup.bash && "
         "source /opt/booster/BoosterRos2Interface/install/setup.bash && "
@@ -406,7 +533,7 @@ def _read_motors_once() -> tuple[list[dict[str, Any]] | None, str, str | None]:
     )
     try:
         proc = subprocess.run(
-            ["bash", "-lc", cmd],
+            ["bash", "-c", cmd],
             capture_output=True,
             text=True,
             timeout=4,
@@ -545,7 +672,10 @@ def _read_battery_percent() -> tuple[int | None, str]:
     if topic_pct is not None:
         return topic_pct, "topic:/battery_state.soc"
 
-    # Some firmware reports capacity=100 while discharging; derive from raw counters first.
+    capacity = _read_battery_int("capacity")
+    if capacity is not None:
+        return max(0, min(100, capacity)), "capacity"
+
     charge_counter = _read_battery_int("charge_counter")
     charge_full_design = _read_battery_int("charge_full_design")
     if (
@@ -555,10 +685,6 @@ def _read_battery_percent() -> tuple[int | None, str]:
     ):
         pct = int(round((100.0 * float(charge_counter)) / float(charge_full_design)))
         return max(0, min(100, pct)), "charge_counter/charge_full_design"
-
-    capacity = _read_battery_int("capacity")
-    if capacity is not None:
-        return max(0, min(100, capacity)), "capacity"
 
     return None, "unavailable"
 
@@ -589,10 +715,10 @@ def _read_battery_percent_from_sdk_binary_once() -> int | None:
     )
     try:
         proc = subprocess.run(
-            ["bash", "-lc", cmd],
+            ["bash", "-c", cmd],
             capture_output=True,
             text=True,
-            timeout=3,
+            timeout=6,
             check=False,
         )
     except Exception:
@@ -625,6 +751,9 @@ def _read_battery_percent_from_topic_cached() -> int | None:
 
 
 def _read_battery_percent_from_topic_once() -> int | None:
+    if not _ros2_cli_ready():
+        return None
+
     cmd = (
         "source /opt/ros/humble/setup.bash && "
         "source /opt/booster/BoosterRos2Interface/install/setup.bash && "
@@ -632,7 +761,7 @@ def _read_battery_percent_from_topic_once() -> int | None:
     )
     try:
         proc = subprocess.run(
-            ["bash", "-lc", cmd],
+            ["bash", "-c", cmd],
             capture_output=True,
             text=True,
             timeout=3,
@@ -667,6 +796,9 @@ def _call_change_mode_rpc(mode_value: int) -> dict[str, Any]:
 def _call_rpc_service(
     service: str, api_id: int, body: dict[str, Any], timeout_sec: int = 8
 ) -> dict[str, Any]:
+    if not _ros2_cli_ready():
+        return {"ok": False, "error": "ROS2 CLI unavailable on this host"}
+
     body_json = json.dumps(body, ensure_ascii=False, separators=(",", ":"))
     payload = "{msg: {api_id: " + str(api_id) + ", body: " + shlex.quote(body_json) + "}}"
     cmd = (
@@ -680,7 +812,7 @@ def _call_rpc_service(
     _debug_log(f"$ {cmd}")
     try:
         proc = subprocess.run(
-            ["bash", "-lc", cmd],
+            ["bash", "-c", cmd],
             capture_output=True,
             text=True,
             timeout=timeout_sec,
@@ -702,26 +834,33 @@ def _call_rpc_service(
     return {"ok": True, "output": out.strip()}
 
 
-def _run_shell(cmd: str, timeout_sec: int = 4) -> tuple[int, str]:
-    _debug_log(f"$ {cmd}")
+def _run_shell(
+    cmd: str, timeout_sec: int = 4, log_command: bool = True, log_output: bool = True
+) -> tuple[int, str]:
+    if log_command:
+        _debug_log(f"$ {cmd}")
     try:
         proc = subprocess.run(
-            ["bash", "-lc", cmd],
+            ["bash", "-c", cmd],
             capture_output=True,
             text=True,
             timeout=timeout_sec,
             check=False,
         )
     except Exception as exc:
-        _debug_log(f"shell exception: {exc}")
+        if log_output:
+            _debug_log(f"shell exception: {exc}")
         return 1, str(exc)
     out = (proc.stdout or "") + (proc.stderr or "")
-    if out.strip():
+    if log_output and out.strip():
         _debug_log(_truncate_debug(out.strip()))
     return proc.returncode, out
 
 
 def _read_audio_activity_cached() -> tuple[float, bool, str | None]:
+    if not AUDIO_ACTIVITY_ENABLED:
+        return 0.0, False, "audio activity disabled"
+
     now = time.monotonic()
     if (now - state.audio_ts) < 0.35:
         return state.audio_level, state.audio_active, state.audio_error
@@ -754,7 +893,7 @@ def _read_audio_level_once() -> tuple[float, str | None]:
         cmd = f"timeout 0.30 arecord -q -D {shlex.quote(dev)} -f S16_LE -c 1 -r 8000 -t raw"
         try:
             proc = subprocess.run(
-                ["bash", "-lc", cmd],
+                ["bash", "-c", cmd],
                 capture_output=True,
                 timeout=2.0,
                 check=False,
@@ -789,6 +928,140 @@ def _read_audio_level_once() -> tuple[float, str | None]:
     return max(0.0, min(1.0, level)), None
 
 
+def _load_env_file() -> None:
+    env_path = Path(__file__).resolve().parents[3] / ".env"
+    if not env_path.exists():
+        return
+    try:
+        for raw in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            if line.startswith("export "):
+                line = line[len("export ") :].strip()
+            key, val = line.split("=", 1)
+            key = key.strip()
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in ("'", '"'):
+                val = val[1:-1]
+            if key and key not in os.environ:
+                os.environ[key] = val
+    except Exception:
+        return
+
+
+def _resolve_openai_api_key() -> str:
+    for name in OPENAI_KEY_NAMES:
+        token = os.environ.get(name, "").strip()
+        if token:
+            return token
+    return ""
+
+
+def _speech_ready_state() -> tuple[bool, str | None, str | None]:
+    piper_ready, piper_error = _piper_ready_state()
+    if not piper_ready:
+        return False, piper_error, None
+    _load_env_file()
+    api_key = _resolve_openai_api_key()
+    if not api_key:
+        return False, "OpenAI API key missing", DEFAULT_PIPER_VOICE
+    return True, None, DEFAULT_PIPER_VOICE
+
+
+def _query_openai_response(
+    api_key: str, prompt: str, system_prompt: str, model: str
+) -> tuple[str | None, str | None]:
+    payload = {
+        "model": model,
+        "input": prompt,
+        "instructions": system_prompt,
+    }
+    req = urlrequest.Request(
+        OPENAI_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    ca_bundle = os.environ.get("OPENAI_CA_BUNDLE", "").strip()
+    ssl_ctx = None
+    if ca_bundle:
+        ssl_ctx = ssl.create_default_context(cafile=ca_bundle)
+    else:
+        try:
+            import certifi  # type: ignore
+
+            ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ssl_ctx = ssl.create_default_context()
+
+    try:
+        with urlrequest.urlopen(req, timeout=OPENAI_TIMEOUT_SEC, context=ssl_ctx) as resp:
+            raw = resp.read().decode("utf-8")
+    except urlerror.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        return None, f"HTTP {exc.code}: {body}"
+    except Exception as exc:
+        return None, str(exc)
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        return None, f"invalid OpenAI response: {exc}"
+
+    text = parsed.get("output_text")
+    if isinstance(text, str) and text.strip():
+        return text.strip(), None
+
+    output = parsed.get("output")
+    chunks: list[str] = []
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for part in content:
+                if not isinstance(part, dict):
+                    continue
+                if part.get("type") != "output_text":
+                    continue
+                piece = part.get("text")
+                if isinstance(piece, str):
+                    chunks.append(piece)
+
+    joined = "".join(chunks).strip()
+    if joined:
+        return joined, None
+    return None, "no text found in OpenAI response"
+
+
+def _prepare_tts_text(text: str) -> str:
+    cleaned = (text or "").replace("\r\n", "\n").strip()
+    if not cleaned:
+        return ""
+
+    cleaned = re.sub(r"\[([^\]]+)\]\(([^)]+)\)", r"\1", cleaned)
+    cleaned = cleaned.replace("```", " ").replace("`", "")
+    cleaned = cleaned.replace("**", "").replace("__", "")
+    cleaned = cleaned.replace("*", "").replace("_", "")
+    cleaned = re.sub(r"^\s*[-*]\s+", "", cleaned, flags=re.MULTILINE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned or (text or "").strip()
+
+
+def _supports_espeak_voice_failure(stderr_text: str) -> bool:
+    low = (stderr_text or "").lower()
+    if "espeak_voice" not in low and "--espeak_voice" not in low:
+        return False
+    return any(token in low for token in ("unrecognized", "unknown", "invalid option", "no such option"))
+
+
 def _piper_ready_state() -> tuple[bool, str | None]:
     if not PIPER_BIN.exists():
         return False, f"piper binary not found: {PIPER_BIN}"
@@ -799,6 +1072,21 @@ def _piper_ready_state() -> tuple[bool, str | None]:
     if not config.exists():
         return False, f"piper config missing: {config}"
     return True, None
+
+
+def _list_piper_voice_ids() -> list[str]:
+    try:
+        if not PIPER_VOICE_DIR.exists():
+            return []
+        voice_ids: list[str] = []
+        for model_path in sorted(PIPER_VOICE_DIR.glob("*.onnx")):
+            config_path = Path(str(model_path) + ".json")
+            if not config_path.exists():
+                continue
+            voice_ids.append(model_path.stem)
+        return voice_ids
+    except Exception:
+        return []
 
 
 def _resolve_piper_voice(voice: str) -> tuple[Path | None, Path | None, str]:
@@ -822,16 +1110,25 @@ def _read_sample_rate_from_piper_config(config_path: Path) -> int:
     return 22050
 
 
-def _speak_with_piper(text: str, voice: str) -> tuple[bool, str | None, str]:
+def _speak_with_piper(text: str, voice: str) -> tuple[bool, str | None, str, str | None, str]:
     ready, ready_err = _piper_ready_state()
     if not ready:
-        return False, ready_err, voice
+        return False, ready_err, voice, None, "none"
 
     model, config, voice_id = _resolve_piper_voice(voice)
     if model is None or config is None:
-        return False, f"piper voice not found: {voice_id}", voice_id
+        return False, f"piper voice not found: {voice_id}", voice_id, None, "none"
 
     piper_cmd_base = [str(PIPER_BIN), "--model", str(model), "--config", str(config)]
+    if PIPER_LENGTH_SCALE:
+        try:
+            length_scale = float(PIPER_LENGTH_SCALE)
+            if length_scale > 0:
+                piper_cmd_base.extend(["--length_scale", str(length_scale)])
+        except Exception:
+            pass
+    if PIPER_ESPEAK_VOICE:
+        piper_cmd_base.extend(["--espeak_voice", PIPER_ESPEAK_VOICE])
     try:
         with tempfile.NamedTemporaryFile(prefix="piper_", suffix=".wav", delete=True) as wav_file:
             piper_cmd = piper_cmd_base + ["--output_file", wav_file.name]
@@ -844,23 +1141,84 @@ def _speak_with_piper(text: str, voice: str) -> tuple[bool, str | None, str]:
                 check=False,
             )
             piper_stderr = (piper_proc.stderr or b"").decode("utf-8", errors="ignore")
+            if piper_proc.returncode != 0 and PIPER_ESPEAK_VOICE and _supports_espeak_voice_failure(piper_stderr):
+                fallback_cmd = [str(PIPER_BIN), "--model", str(model), "--config", str(config)]
+                if PIPER_LENGTH_SCALE:
+                    try:
+                        length_scale = float(PIPER_LENGTH_SCALE)
+                        if length_scale > 0:
+                            fallback_cmd.extend(["--length_scale", str(length_scale)])
+                    except Exception:
+                        pass
+                fallback_cmd.extend(["--output_file", wav_file.name])
+                _debug_log("piper --espeak_voice unsupported; retrying without it")
+                _debug_log(f"$ {' '.join(shlex.quote(p) for p in fallback_cmd)}")
+                piper_proc = subprocess.run(
+                    fallback_cmd,
+                    input=text.encode("utf-8"),
+                    capture_output=True,
+                    timeout=25,
+                    check=False,
+                )
+                piper_stderr = (piper_proc.stderr or b"").decode("utf-8", errors="ignore")
             if piper_proc.returncode != 0:
-                return False, piper_stderr.strip() or f"piper rc={piper_proc.returncode}", voice_id
+                return False, piper_stderr.strip() or f"piper rc={piper_proc.returncode}", voice_id, None, "none"
 
-            aplay_cmd = ["aplay", "-q", "-D", PIPER_APLAY_DEVICE, wav_file.name]
-            _debug_log(f"$ {' '.join(shlex.quote(p) for p in aplay_cmd)}")
-            aplay_proc = subprocess.run(
-                aplay_cmd,
-                capture_output=True,
-                timeout=25,
-                check=False,
-            )
-            aplay_stderr = (aplay_proc.stderr or b"").decode("utf-8", errors="ignore")
-            if aplay_proc.returncode != 0:
-                return False, aplay_stderr.strip() or f"aplay rc={aplay_proc.returncode}", voice_id
+            wav_bytes = Path(wav_file.name).read_bytes()
+            if not wav_bytes:
+                return False, "piper produced empty audio", voice_id, None, "none"
+
+            mode = PIPER_PLAYBACK_MODE
+            if mode not in ("auto", "aplay", "afplay", "browser"):
+                mode = "auto"
+
+            if mode in ("auto", "aplay"):
+                if shutil.which("aplay"):
+                    aplay_cmd = ["aplay", "-q", "-D", PIPER_APLAY_DEVICE, wav_file.name]
+                    _debug_log(f"$ {' '.join(shlex.quote(p) for p in aplay_cmd)}")
+                    aplay_proc = subprocess.run(
+                        aplay_cmd,
+                        capture_output=True,
+                        timeout=25,
+                        check=False,
+                    )
+                    aplay_stderr = (aplay_proc.stderr or b"").decode("utf-8", errors="ignore")
+                    if aplay_proc.returncode == 0:
+                        return True, None, voice_id, None, "aplay"
+                    if mode == "aplay":
+                        return False, aplay_stderr.strip() or f"aplay rc={aplay_proc.returncode}", voice_id, None, "aplay"
+                    _debug_log("aplay failed, falling back to browser audio playback")
+                elif mode == "aplay":
+                    return False, "aplay not found", voice_id, None, "aplay"
+
+            if mode in ("auto", "afplay"):
+                if shutil.which("afplay"):
+                    afplay_cmd = ["afplay", wav_file.name]
+                    _debug_log(f"$ {' '.join(shlex.quote(p) for p in afplay_cmd)}")
+                    afplay_proc = subprocess.run(
+                        afplay_cmd,
+                        capture_output=True,
+                        timeout=25,
+                        check=False,
+                    )
+                    afplay_stderr = (afplay_proc.stderr or b"").decode("utf-8", errors="ignore")
+                    if afplay_proc.returncode == 0:
+                        return True, None, voice_id, None, "afplay"
+                    if mode == "afplay":
+                        return (
+                            False,
+                            afplay_stderr.strip() or f"afplay rc={afplay_proc.returncode}",
+                            voice_id,
+                            None,
+                            "afplay",
+                        )
+                    _debug_log("afplay failed, falling back to browser audio playback")
+                elif mode == "afplay":
+                    return False, "afplay not found", voice_id, None, "afplay"
+
+            return True, None, voice_id, base64.b64encode(wav_bytes).decode("ascii"), "browser"
     except Exception as exc:
-        return False, str(exc), voice_id
-    return True, None, voice_id
+        return False, str(exc), voice_id, None, "none"
 
 
 def _parse_volume_percent(output: str) -> int | None:
@@ -879,13 +1237,17 @@ def _parse_volume_percent(output: str) -> int | None:
 
 
 def _read_volume_percent() -> tuple[int | None, str]:
-    commands = [
-        ("amixer:pulse", "amixer -D pulse sget Master"),
-        ("amixer:default", "amixer sget Master"),
-        ("pactl:default", "pactl get-sink-volume @DEFAULT_SINK@"),
-    ]
+    commands: list[tuple[str, str]] = []
+    if shutil.which("amixer"):
+        commands.append(("amixer:pulse", "amixer -D pulse sget Master"))
+        commands.append(("amixer:default", "amixer sget Master"))
+    if shutil.which("pactl"):
+        commands.append(("pactl:default", "pactl get-sink-volume @DEFAULT_SINK@"))
+    if not commands:
+        return None, "unavailable"
+
     for source, cmd in commands:
-        rc, out = _run_shell(cmd, timeout_sec=3)
+        rc, out = _run_shell(cmd, timeout_sec=3, log_command=False, log_output=False)
         if rc != 0:
             continue
         pct = _parse_volume_percent(out)
@@ -896,24 +1258,35 @@ def _read_volume_percent() -> tuple[int | None, str]:
 
 def _set_volume_percent(percent: int) -> tuple[bool, str, str | None]:
     pct = max(0, min(100, int(percent)))
-    commands = [
+    commands: list[tuple[str, str]] = [
         (
             "bashrc:vol",
             "source ~/.bashrc >/dev/null 2>&1 || true; "
             + "if command -v vol >/dev/null 2>&1; then vol "
             + str(pct)
             + "; else exit 127; fi",
-        ),
-        ("amixer:pulse", "amixer -D pulse sset Master " + str(pct) + "%"),
-        ("pactl:default", "pactl set-sink-volume @DEFAULT_SINK@ " + str(pct) + "%"),
+        )
     ]
+    if shutil.which("amixer"):
+        commands.append(("amixer:pulse", "amixer -D pulse sset Master " + str(pct) + "%"))
+    if shutil.which("pactl"):
+        commands.append(("pactl:default", "pactl set-sink-volume @DEFAULT_SINK@ " + str(pct) + "%"))
+
     last_error: str | None = None
     for source, cmd in commands:
-        rc, out = _run_shell(cmd, timeout_sec=4)
+        rc, out = _run_shell(cmd, timeout_sec=4, log_command=False, log_output=False)
         if rc == 0:
             return True, source, None
         last_error = out.strip() or f"rc={rc}"
     return False, "unavailable", last_error
+
+
+def _ros2_cli_ready() -> bool:
+    return (
+        shutil.which("ros2") is not None
+        and Path("/opt/ros/humble/setup.bash").exists()
+        and Path("/opt/booster/BoosterRos2Interface/install/setup.bash").exists()
+    )
 
 
 def _read_volume_percent_from_bashrc() -> int | None:

@@ -26,6 +26,60 @@ let volumeSetInFlight = false;
 let pendingVolumePercent = null;
 let micToggleSyncing = false;
 let debugCursor = 0;
+let activeSpeechAudio = null;
+
+function syncVoiceCustomVisibility() {
+  if (!SPEECH_MODULE_ENABLED) {
+    customVoiceEl.style.display = "none";
+    return;
+  }
+  customVoiceEl.style.display = voiceTypeEl.value === "custom" ? "block" : "none";
+}
+
+function setVoiceOptions(voices, defaultVoice) {
+  const previous = voiceTypeEl.value;
+  voiceTypeEl.innerHTML = "";
+
+  const normalized = Array.isArray(voices)
+    ? voices.filter((v) => typeof v === "string" && v.trim().length > 0)
+    : [];
+
+  for (const voiceId of normalized) {
+    const opt = document.createElement("option");
+    opt.value = voiceId;
+    opt.textContent = voiceId;
+    voiceTypeEl.appendChild(opt);
+  }
+
+  const customOpt = document.createElement("option");
+  customOpt.value = "custom";
+  customOpt.textContent = "Custom voice model id...";
+  voiceTypeEl.appendChild(customOpt);
+
+  if (previous === "custom") {
+    voiceTypeEl.value = "custom";
+  } else if (normalized.includes(previous)) {
+    voiceTypeEl.value = previous;
+  } else if (defaultVoice && normalized.includes(defaultVoice)) {
+    voiceTypeEl.value = defaultVoice;
+  } else if (normalized.length > 0) {
+    voiceTypeEl.value = normalized[0];
+  } else {
+    voiceTypeEl.value = "custom";
+  }
+  syncVoiceCustomVisibility();
+}
+
+async function loadVoices() {
+  try {
+    const data = await api("/api/voices");
+    setVoiceOptions(data.voices || [], data.default_voice || "");
+    appendDebugObject("voices", { voice_dir: data.voice_dir, count: Array.isArray(data.voices) ? data.voices.length : 0 });
+  } catch (err) {
+    setVoiceOptions([], "");
+    appendDebugObject("voices error", err.message || String(err));
+  }
+}
 
 function appendDebugLine(line) {
   const atBottom = outputEl.scrollTop + outputEl.clientHeight >= outputEl.scrollHeight - 20;
@@ -386,10 +440,58 @@ async function submitSpeak() {
     speakBtn.disabled = true;
     const data = await apiPost("/api/speak", { text, voice_type: selected });
     appendDebugObject("speak", data);
+    if (data && typeof data.assistant_text === "string" && data.assistant_text.trim()) {
+      appendDebugLine(`[assistant] ${data.assistant_text.trim()}`);
+    }
+    if (data && typeof data.tts_text === "string" && data.tts_text.trim()) {
+      appendDebugLine(`[spoken] ${data.tts_text.trim()}`);
+    }
+    if (data && typeof data.audio_base64 === "string" && data.audio_base64.length > 16) {
+      playSpeechAudioFromBase64(data.audio_base64, data.audio_mime || "audio/wav");
+    }
   } catch (err) {
     appendDebugObject("speak error", err.message || String(err));
   } finally {
     speakBtn.disabled = false;
+  }
+}
+
+function playSpeechAudioFromBase64(base64Data, mimeType) {
+  try {
+    const bytes = atob(base64Data);
+    const buffer = new Uint8Array(bytes.length);
+    for (let i = 0; i < bytes.length; i += 1) {
+      buffer[i] = bytes.charCodeAt(i);
+    }
+    const blob = new Blob([buffer], { type: mimeType || "audio/wav" });
+    const url = URL.createObjectURL(blob);
+    if (activeSpeechAudio) {
+      activeSpeechAudio.pause();
+      activeSpeechAudio = null;
+    }
+    const audio = new Audio(url);
+    activeSpeechAudio = audio;
+    audio.onended = () => {
+      URL.revokeObjectURL(url);
+      if (activeSpeechAudio === audio) {
+        activeSpeechAudio = null;
+      }
+    };
+    audio.onerror = () => {
+      URL.revokeObjectURL(url);
+      appendDebugLine("[ui] speak playback error");
+      if (activeSpeechAudio === audio) {
+        activeSpeechAudio = null;
+      }
+    };
+    const playPromise = audio.play();
+    if (playPromise && typeof playPromise.catch === "function") {
+      playPromise.catch((err) => {
+        appendDebugObject("speak playback blocked", err && err.message ? err.message : String(err));
+      });
+    }
+  } catch (err) {
+    appendDebugObject("speak audio decode error", err && err.message ? err.message : String(err));
   }
 }
 
@@ -403,11 +505,7 @@ speakTextEl.addEventListener("keydown", (event) => {
 });
 
 voiceTypeEl.addEventListener("change", () => {
-  if (!SPEECH_MODULE_ENABLED) {
-    customVoiceEl.style.display = "none";
-    return;
-  }
-  customVoiceEl.style.display = voiceTypeEl.value === "custom" ? "block" : "none";
+  syncVoiceCustomVisibility();
 });
 
 volumeSliderEl.addEventListener("input", () => {
@@ -436,6 +534,7 @@ updateSpeakReady(false, true, null, null);
 updateMicrophone(false, true);
 outputEl.textContent = "";
 appendDebugLine("[ui] debug stream connected");
+loadVoices();
 refreshHealth();
 refreshMotors();
 refreshDebug();
