@@ -65,6 +65,39 @@ Notes:
 - Robot deployment is unchanged: robot scripts/services still use their existing Linux paths and `aplay`.
 - On macOS, playback mode `auto` now tries `aplay` then `afplay`, then returns browser-playable audio.
 
+### Sherpa ASR model notes
+
+The repo does not commit Sherpa model binaries. Keep them downloaded locally and point
+`BOOSTER_SHERPA_ASR_MODEL_DIR` at the extracted model directory instead.
+
+Expected model directory:
+
+```bash
+sherpa-models/sherpa-onnx-streaming-zipformer-en-2023-06-26
+```
+
+Key files expected in that directory:
+
+```text
+tokens.txt
+bpe.model
+encoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx
+decoder-epoch-99-avg-1-chunk-16-left-128.int8.onnx
+joiner-epoch-99-avg-1-chunk-16-left-128.int8.onnx
+```
+
+Local Mac setup example:
+
+```bash
+cd /Users/wthierry/Development/pc_booster_control
+mkdir -p sherpa-models
+cd sherpa-models
+curl -fL -O https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2
+tar -xjf sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2
+rm -f sherpa-onnx-streaming-zipformer-en-2023-06-26.tar.bz2
+export BOOSTER_SHERPA_ASR_MODEL_DIR=/Users/wthierry/Development/pc_booster_control/sherpa-models/sherpa-onnx-streaming-zipformer-en-2023-06-26
+```
+
 ## Run with ROS2 workspace
 
 ```bash
