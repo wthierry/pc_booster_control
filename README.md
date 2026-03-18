@@ -129,6 +129,10 @@ cd /home/booster/pc_booster_control
 cp -n .env.robot.example .env
 ```
 
+Default robot account:
+- User: `booster`
+- Default password: `123456`
+
 Then restart service:
 
 ```bash

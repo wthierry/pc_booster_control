@@ -2,6 +2,10 @@
 
 Date: 2026-03-01
 
+## Access
+- Default robot user: `booster`
+- Default robot password: `123456`
+
 ## Code Sync State
 Core project files are hash-matched between local and robot:
 - `src/pc_booster_control/pc_booster_control/web_server.py`
