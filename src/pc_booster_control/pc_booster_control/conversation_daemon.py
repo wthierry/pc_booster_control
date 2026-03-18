@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from .memory_store import append_history_turn, build_prompt_with_context, capture_implicit_memory, maybe_handle_memory_command
 
 OPENAI_API_URL = "https://api.openai.com/v1/responses"
 OPENAI_MODEL = "gpt-4.1-mini"
@@ -126,6 +127,22 @@ def _resolve_openai_api_key() -> str:
         if token:
             return token
     return ""
+
+
+def _resolve_system_prompt() -> str:
+    prompt_file = os.environ.get("CHATGPT_SYSTEM_PROMPT_FILE", "").strip()
+    if prompt_file:
+        prompt_path = Path(prompt_file)
+        if not prompt_path.is_absolute():
+            prompt_path = Path(__file__).resolve().parents[3] / prompt_path
+        try:
+            text = prompt_path.read_text(encoding="utf-8").strip()
+            if text:
+                return text
+        except Exception as exc:
+            _log(f"system prompt file read failed: {prompt_path} ({exc})")
+    inline_prompt = os.environ.get("CHATGPT_SYSTEM_PROMPT", "").strip()
+    return inline_prompt or DEFAULT_SYSTEM_PROMPT
 
 
 def _query_openai_response(api_key: str, prompt: str, system_prompt: str, model: str) -> tuple[str | None, str | None]:
@@ -415,7 +432,7 @@ def main() -> int:
     if not api_key:
         _log("OpenAI key missing (OPENAI_API_KEY/CHATGPT_API_KEY)")
         return 1
-    system_prompt = os.environ.get("CHATGPT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip() or DEFAULT_SYSTEM_PROMPT
+    system_prompt = _resolve_system_prompt()
     _log(f"conversation daemon started (wake_word={CONVO_WAKE_WORD})")
 
     while not _STOP:
@@ -426,14 +443,24 @@ def main() -> int:
         user_text = _capture_user_text()
         if not user_text:
             continue
-        assistant_text, err = _query_openai_response(api_key, user_text, system_prompt, OPENAI_MODEL)
-        if err:
-            _log(f"openai error: {err}")
-            time.sleep(CONVO_RETRY_SLEEP_SEC)
-            continue
-        if not assistant_text:
-            _log("openai returned empty text")
-            continue
+        memory_reply = maybe_handle_memory_command(user_text)
+        if memory_reply:
+            assistant_text = memory_reply
+        else:
+            capture_implicit_memory(user_text)
+            assistant_text, err = _query_openai_response(
+                api_key,
+                build_prompt_with_context(user_text, llm_backend="openai", llm_model=OPENAI_MODEL),
+                system_prompt,
+                OPENAI_MODEL,
+            )
+            if err:
+                _log(f"openai error: {err}")
+                time.sleep(CONVO_RETRY_SLEEP_SEC)
+                continue
+            if not assistant_text:
+                _log("openai returned empty text")
+                continue
         _log(f"assistant: {assistant_text}")
         tts_text = _prepare_tts_text(assistant_text)
         ok, speak_err = _speak_with_piper(tts_text, CONVO_VOICE_TYPE)
@@ -441,6 +468,7 @@ def main() -> int:
             _log(f"tts error: {speak_err}")
             time.sleep(CONVO_RETRY_SLEEP_SEC)
             continue
+        append_history_turn(user_text, assistant_text, llm_backend="openai", llm_model=OPENAI_MODEL)
     _log("conversation daemon stopped")
     return 0
 

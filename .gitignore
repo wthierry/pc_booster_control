@@ -11,3 +11,9 @@ src/booster_robotics_sdk/
 
 # Local Piper model binaries
 piper/voices/*.onnx
+
+# Local Sherpa model artifacts
+sherpa-models/
+
+# Local ChatGPT memory/history
+data/*.json

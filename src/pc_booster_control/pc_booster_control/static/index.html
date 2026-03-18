@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Booster K1 Camera Viewer</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260318-responsive-pass" />
   </head>
   <body>
     <main class="layout">
@@ -31,12 +31,27 @@
         <p id="status" class="status">Checking camera connection...</p>
         <p id="batteryAlert" class="battery-alert" aria-live="polite"></p>
 
-        <div class="streams" id="streamsGrid">
-          <div class="stream-card">
+        <div class="section-header">
+          <h2>Cameras</h2>
+          <button id="streamsToggleBtn" class="section-toggle" type="button" aria-expanded="false" aria-controls="streamsGrid">+</button>
+        </div>
+        <div class="streams" id="streamsGrid" hidden>
+          <div id="colorStreamCard" class="stream-card">
             <h2>Color Camera</h2>
-            <img class="stream-image" id="colorStream" src="/stream/color" alt="Color stream" />
+            <div id="colorStreamPlaceholder" class="stream-placeholder">Checking camera availability...</div>
+            <img class="stream-image" id="colorStream" alt="Color stream" hidden />
           </div>
         </div>
+        <h2>Text Chat</h2>
+        <p id="speakReady" class="status">Initializing Piper...</p>
+        <h2>Chat Reply</h2>
+        <div id="replyWindow" class="reply-window" aria-live="polite">
+          <div id="replyMeta" class="reply-meta">No reply yet.</div>
+          <div id="replyText" class="reply-text">Assistant replies will appear here.</div>
+        </div>
+        <label for="speakText">Message Robot</label>
+        <textarea id="speakText" rows="3" placeholder="Type a message to the robot..."></textarea>
+        <button id="speakBtn">Send Message</button>
         <h2>Debug</h2>
         <pre id="output"></pre>
         <h2>Robot Command</h2>
@@ -55,20 +70,69 @@
           <button id="prepBtn">PREP</button>
         </div>
         <h2>Microphone</h2>
+        <label for="micSource">Audio Capture Source</label>
+        <select id="micSource">
+          <option value="robot">Robot Mic</option>
+          <option value="mac">Mac Mic</option>
+        </select>
         <label class="inline-check">
           <input id="micToggle" type="checkbox" />
-          Enable microphone
+          Enable speech listening
         </label>
-        <h2>Text To Speech</h2>
-        <p id="speakReady" class="status">Initializing Piper...</p>
+        <div id="micHeardWindow" class="reply-window">
+          <div id="micHeardMeta" class="reply-meta">Listening off.</div>
+          <div id="micHeardText" class="reply-text">What Sherpa hears will appear here.</div>
+        </div>
+        <label for="llmBackend">LLM Backend</label>
+        <select id="llmBackend">
+          <option value="openai">OpenAI</option>
+          <option value="ollama">Ollama (qwen2.5:14b)</option>
+        </select>
+        <label for="llmModel">LLM Model</label>
+        <select id="llmModel">
+          <option value="">Loading models...</option>
+        </select>
+        <label class="inline-check">
+          <input id="ttsEnabled" type="checkbox" checked />
+          Enable speech playback
+        </label>
+        <label for="speechBackend">Speech Engine</label>
+        <select id="speechBackend">
+          <option value="piper">Piper</option>
+          <option value="openai">OpenAI Voice</option>
+          <option value="apple">Apple System Voice</option>
+          <option value="kokoro">Kokoro</option>
+        </select>
+        <label for="playbackTarget">Playback Target</label>
+        <select id="playbackTarget">
+          <option value="browser">This Browser</option>
+          <option value="robot">Robot Speakers</option>
+        </select>
         <label for="voiceType">Voice</label>
         <select id="voiceType">
           <option value="">Loading installed voices...</option>
         </select>
-        <input id="customVoice" type="text" placeholder="Custom model id (e.g. en_US-lessac-medium)" style="display:none;" />
-        <label for="speakText">Speak Text</label>
-        <textarea id="speakText" rows="3" placeholder="Type text for Booster to say..."></textarea>
-        <button id="speakBtn">Speak</button>
+        <input id="customVoice" type="text" placeholder="Custom voice id" style="display:none;" />
+        <div id="piperRateGroup">
+          <label for="piperRateSlider">Piper Speech Rate: <span id="piperRateText">1.00x</span></label>
+          <input id="piperRateSlider" type="range" min="0.5" max="2.0" step="0.05" value="1.0" />
+        </div>
+        <div id="piperNoiseScaleGroup" hidden>
+          <label for="piperNoiseScaleSlider">Piper Expression: <span id="piperNoiseScaleText">0.67</span></label>
+          <input id="piperNoiseScaleSlider" type="range" min="0.1" max="2.0" step="0.01" value="0.67" />
+        </div>
+        <div id="piperNoiseWGroup" hidden>
+          <label for="piperNoiseWSlider">Piper Timing Variation: <span id="piperNoiseWText">0.80</span></label>
+          <input id="piperNoiseWSlider" type="range" min="0.1" max="2.0" step="0.01" value="0.8" />
+        </div>
+        <div id="piperSentenceSilenceGroup" hidden>
+          <label for="piperSentenceSilenceSlider">Piper Sentence Pause: <span id="piperSentenceSilenceText">0.20s</span></label>
+          <input id="piperSentenceSilenceSlider" type="range" min="0.0" max="2.0" step="0.05" value="0.2" />
+        </div>
+        <div id="appleRateGroup" hidden>
+          <label for="appleRateSlider">Apple Speech Rate: <span id="appleRateText">1.00x</span></label>
+          <input id="appleRateSlider" type="range" min="0.5" max="2.0" step="0.05" value="1.0" />
+        </div>
         <h2>Volume</h2>
         <label for="volumeSlider">Speaker Volume: <span id="volumeText">--%</span></label>
         <input id="volumeSlider" type="range" min="0" max="100" step="1" value="60" />
@@ -89,6 +153,6 @@
       </section>
     </main>
 
-    <script src="/static/app.js"></script>
+    <script src="/static/app.js?v=20260318-mic-heard-2"></script>
   </body>
 </html>

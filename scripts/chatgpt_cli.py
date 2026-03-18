@@ -20,6 +20,10 @@ import sys
 from urllib import error, request
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src" / "pc_booster_control"))
+
+from pc_booster_control.memory_store import append_history_turn, build_prompt_with_context, capture_implicit_memory, maybe_handle_memory_command
+
 
 API_URL = "https://api.openai.com/v1/responses"
 DEFAULT_MODEL = "gpt-4.1-mini"
@@ -57,6 +61,22 @@ def resolve_api_key() -> str:
         if value:
             return value
     return ""
+
+
+def resolve_system_prompt() -> str:
+    prompt_file = os.environ.get("CHATGPT_SYSTEM_PROMPT_FILE", "").strip()
+    if prompt_file:
+        prompt_path = Path(prompt_file)
+        if not prompt_path.is_absolute():
+            prompt_path = Path(__file__).resolve().parents[1] / prompt_path
+        try:
+            text = prompt_path.read_text(encoding="utf-8").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+    inline_prompt = os.environ.get("CHATGPT_SYSTEM_PROMPT", "").strip()
+    return inline_prompt or DEFAULT_SYSTEM_PROMPT
 
 
 def call_openai(api_key: str, model: str, prompt: str, system_prompt: str) -> str:
@@ -130,7 +150,7 @@ def main() -> int:
     parser.add_argument("--model", default=DEFAULT_MODEL, help=f"Model (default: {DEFAULT_MODEL})")
     parser.add_argument(
         "--system",
-        default=os.environ.get("CHATGPT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT),
+        default=resolve_system_prompt(),
         help="System persona/instructions prompt for the assistant.",
     )
     parser.add_argument(
@@ -151,7 +171,20 @@ def main() -> int:
             print("Prompt is empty", file=sys.stderr)
             return 1
         try:
-            print(call_openai(api_key, args.model, prompt, args.system))
+            memory_reply = maybe_handle_memory_command(prompt)
+            if memory_reply:
+                print(memory_reply)
+                append_history_turn(prompt, memory_reply, llm_backend="openai", llm_model=args.model)
+                return 0
+            capture_implicit_memory(prompt)
+            assistant_text = call_openai(
+                api_key,
+                args.model,
+                build_prompt_with_context(prompt, llm_backend="openai", llm_model=args.model),
+                args.system,
+            )
+            print(assistant_text)
+            append_history_turn(prompt, assistant_text, llm_backend="openai", llm_model=args.model)
             return 0
         except Exception as exc:
             print(f"Error: {exc}", file=sys.stderr)
@@ -163,7 +196,20 @@ def main() -> int:
         if initial:
             try:
                 print(f"> {initial}")
-                print(call_openai(api_key, args.model, initial, args.system))
+                memory_reply = maybe_handle_memory_command(initial)
+                if memory_reply:
+                    print(memory_reply)
+                    append_history_turn(initial, memory_reply, llm_backend="openai", llm_model=args.model)
+                else:
+                    capture_implicit_memory(initial)
+                    assistant_text = call_openai(
+                        api_key,
+                        args.model,
+                        build_prompt_with_context(initial, llm_backend="openai", llm_model=args.model),
+                        args.system,
+                    )
+                    print(assistant_text)
+                    append_history_turn(initial, assistant_text, llm_backend="openai", llm_model=args.model)
             except Exception as exc:
                 print(f"Error: {exc}", file=sys.stderr)
 
@@ -178,7 +224,20 @@ def main() -> int:
         if line.lower() in {"exit", "quit"}:
             break
         try:
-            print(call_openai(api_key, args.model, line, args.system))
+            memory_reply = maybe_handle_memory_command(line)
+            if memory_reply:
+                print(memory_reply)
+                append_history_turn(line, memory_reply, llm_backend="openai", llm_model=args.model)
+                continue
+            capture_implicit_memory(line)
+            assistant_text = call_openai(
+                api_key,
+                args.model,
+                build_prompt_with_context(line, llm_backend="openai", llm_model=args.model),
+                args.system,
+            )
+            print(assistant_text)
+            append_history_turn(line, assistant_text, llm_backend="openai", llm_model=args.model)
         except Exception as exc:
             print(f"Error: {exc}", file=sys.stderr)
     return 0

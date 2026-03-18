@@ -3,6 +3,7 @@ import shlex
 import shutil
 import ssl
 import subprocess
+import sys
 import threading
 import time
 import re
@@ -10,6 +11,8 @@ import json
 import struct
 import tempfile
 import base64
+import io
+import wave
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -18,6 +21,7 @@ from urllib import request as urlrequest
 
 import uvicorn
 from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from starlette.staticfiles import StaticFiles
@@ -53,12 +57,28 @@ try:
     import rclpy
     from rclpy.executors import MultiThreadedExecutor
 
+    from .memory_store import (
+        append_history_turn,
+        build_chat_messages_with_context,
+        build_prompt_with_context,
+        capture_implicit_memory,
+        describe_saved_memory,
+        maybe_handle_memory_command,
+    )
     from .web_bridge import RosWebBridge
 except Exception as exc:  # pragma: no cover - runtime environment dependent
     ROS_AVAILABLE = False
     ROS_IMPORT_ERROR = str(exc)
     rclpy = None  # type: ignore[assignment]
     MultiThreadedExecutor = Any  # type: ignore[misc,assignment]
+    from .memory_store import (
+        append_history_turn,
+        build_chat_messages_with_context,
+        build_prompt_with_context,
+        capture_implicit_memory,
+        describe_saved_memory,
+        maybe_handle_memory_command,
+    )
     RosWebBridge = Any  # type: ignore[misc,assignment]
 
 
@@ -84,6 +104,17 @@ def _resolve_default_piper_voice_dir() -> Path:
     return Path("/home/booster/piper/voices")
 
 
+def _resolve_default_sherpa_model_dir() -> Path:
+    local_model_dir = (
+        Path(__file__).resolve().parents[3]
+        / "sherpa-models"
+        / "sherpa-onnx-streaming-zipformer-en-2023-06-26"
+    )
+    if local_model_dir.exists():
+        return local_model_dir
+    return Path("/home/booster/sherpa-onnx-models/sherpa-onnx-streaming-zipformer-en-2023-06-26")
+
+
 DEFAULT_COLOR_TOPIC = os.environ.get("BOOSTER_COLOR_TOPIC", "/StereoNetNode/rectified_image")
 DEFAULT_DEPTH_TOPIC = os.environ.get("BOOSTER_DEPTH_TOPIC", "/StereoNetNode/stereonet_depth")
 BATTERY_SYSFS_DIR = Path("/sys/class/power_supply/battery")
@@ -104,10 +135,48 @@ PIPER_APLAY_DEVICE = os.environ.get("BOOSTER_PIPER_APLAY_DEVICE", "plughw:CARD=D
 PIPER_PLAYBACK_MODE = os.environ.get("BOOSTER_PIPER_PLAYBACK_MODE", "auto").strip().lower()
 PIPER_LENGTH_SCALE = os.environ.get("BOOSTER_PIPER_LENGTH_SCALE", "").strip()
 PIPER_ESPEAK_VOICE = os.environ.get("BOOSTER_PIPER_ESPEAK_VOICE", "").strip()
+APPLE_TTS_DEFAULT_VOICE = os.environ.get("BOOSTER_APPLE_TTS_DEFAULT_VOICE", "Daniel").strip() or "Daniel"
+APPLE_TTS_DEFAULT_RATE = float(os.environ.get("BOOSTER_APPLE_TTS_DEFAULT_RATE", "1.0") or "1.0")
+KOKORO_REPO_ID = os.environ.get("BOOSTER_KOKORO_REPO_ID", "hexgrad/Kokoro-82M").strip() or "hexgrad/Kokoro-82M"
+KOKORO_DEFAULT_VOICE = os.environ.get("BOOSTER_KOKORO_DEFAULT_VOICE", "af_heart").strip() or "af_heart"
 OPENAI_API_URL = os.environ.get("BOOSTER_OPENAI_API_URL", "https://api.openai.com/v1/responses")
 OPENAI_MODEL = os.environ.get("BOOSTER_OPENAI_MODEL", "gpt-4.1-mini")
 OPENAI_TIMEOUT_SEC = int(os.environ.get("BOOSTER_OPENAI_TIMEOUT_SEC", "60"))
+OLLAMA_API_URL = os.environ.get("BOOSTER_OLLAMA_API_URL", "http://127.0.0.1:11434/api/chat").strip() or "http://127.0.0.1:11434/api/chat"
+OLLAMA_MODEL = os.environ.get("BOOSTER_OLLAMA_MODEL", "qwen2.5:14b").strip() or "qwen2.5:14b"
+OLLAMA_TIMEOUT_SEC = int(os.environ.get("BOOSTER_OLLAMA_TIMEOUT_SEC", "120"))
+REMOTE_TTS_CATALOG_URL = os.environ.get("BOOSTER_REMOTE_TTS_CATALOG_URL", "").strip()
+REMOTE_TTS_CATALOG_TIMEOUT_SEC = int(os.environ.get("BOOSTER_REMOTE_TTS_CATALOG_TIMEOUT_SEC", "5"))
+REMOTE_ASSISTANT_BASE_URL = os.environ.get("BOOSTER_REMOTE_ASSISTANT_BASE_URL", "").strip().rstrip("/")
+REMOTE_ASSISTANT_TIMEOUT_SEC = int(os.environ.get("BOOSTER_REMOTE_ASSISTANT_TIMEOUT_SEC", "180"))
 OPENAI_KEY_NAMES = ("OPENAI_API_KEY", "CHATGPT_API_KEY", "CHAT_GPT_API", "API_KEY")
+OPENAI_TTS_API_URL = os.environ.get("BOOSTER_OPENAI_TTS_API_URL", "https://api.openai.com/v1/audio/speech")
+OPENAI_TTS_MODEL = os.environ.get("BOOSTER_OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+OPENAI_TTS_DEFAULT_VOICE = os.environ.get("BOOSTER_OPENAI_TTS_DEFAULT_VOICE", "alloy").strip() or "alloy"
+OPENAI_TTS_VOICES = tuple(
+    voice.strip()
+    for voice in os.environ.get(
+        "BOOSTER_OPENAI_TTS_VOICES",
+        "alloy,ash,ballad,coral,echo,sage,shimmer,verse",
+    ).split(",")
+    if voice.strip()
+)
+DEFAULT_TTS_BACKEND = os.environ.get("BOOSTER_TTS_BACKEND", "piper").strip().lower() or "piper"
+DEFAULT_PIPER_NOISE_SCALE = float(os.environ.get("BOOSTER_PIPER_DEFAULT_NOISE_SCALE", "0.667"))
+DEFAULT_PIPER_NOISE_W = float(os.environ.get("BOOSTER_PIPER_DEFAULT_NOISE_W", "0.8"))
+DEFAULT_PIPER_SENTENCE_SILENCE = float(os.environ.get("BOOSTER_PIPER_DEFAULT_SENTENCE_SILENCE", "0.2"))
+DEFAULT_LLM_BACKEND = os.environ.get("BOOSTER_LLM_BACKEND", "openai").strip().lower() or "openai"
+SHERPA_ASR_MODEL_DIR = Path(os.environ.get("BOOSTER_SHERPA_ASR_MODEL_DIR", str(_resolve_default_sherpa_model_dir())))
+SHERPA_DEVICE_NAME = os.environ.get("BOOSTER_SHERPA_DEVICE_NAME", "").strip()
+SHERPA_STT_MAX_SECONDS = float(os.environ.get("BOOSTER_SHERPA_STT_MAX_SECONDS", "12"))
+SHERPA_ASR_SCRIPT = Path(__file__).resolve().parents[3] / "scripts" / "sherpa_asr_once_mac.py"
+ROBOT_AUDIO_SSH_HOST = os.environ.get("BOOSTER_ROBOT_AUDIO_SSH_HOST", "booster").strip() or "booster"
+ROBOT_AUDIO_SSH_USER = os.environ.get("BOOSTER_ROBOT_AUDIO_SSH_USER", "booster").strip() or "booster"
+ROBOT_AUDIO_SSH_PORT = max(1, int(os.environ.get("BOOSTER_ROBOT_AUDIO_SSH_PORT", "22")))
+ROBOT_AUDIO_DIR = os.environ.get("BOOSTER_ROBOT_AUDIO_DIR", "/tmp/booster_tts").strip() or "/tmp/booster_tts"
+ROBOT_AUDIO_APLAY_DEVICE = (
+    os.environ.get("BOOSTER_ROBOT_AUDIO_APLAY_DEVICE", "plughw:CARD=Device,DEV=0").strip() or "plughw:CARD=Device,DEV=0"
+)
 DEFAULT_SYSTEM_PROMPT = (
     "You are Booster K1's onboard assistant. Keep responses concise, practical, and lightly witty."
 )
@@ -118,6 +187,40 @@ AUDIO_ACTIVITY_ENABLED = os.environ.get("BOOSTER_AUDIO_ACTIVITY_ENABLED", _audio
     "false",
     "False",
 )
+LAST_SET_VOLUME_PERCENT: int | None = None
+KOKORO_PIPELINE_CACHE: dict[str, Any] = {}
+KOKORO_PIPELINE_LOCK = threading.Lock()
+
+DEFAULT_KOKORO_VOICES = [
+    "af_alloy",
+    "af_aoede",
+    "af_bella",
+    "af_heart",
+    "af_jessica",
+    "af_kore",
+    "af_nicole",
+    "af_nova",
+    "af_river",
+    "af_sarah",
+    "af_sky",
+    "am_adam",
+    "am_echo",
+    "am_eric",
+    "am_fenrir",
+    "am_liam",
+    "am_michael",
+    "am_onyx",
+    "am_puck",
+    "am_santa",
+    "bf_alice",
+    "bf_emma",
+    "bf_isabella",
+    "bf_lily",
+    "bm_daniel",
+    "bm_fable",
+    "bm_george",
+    "bm_lewis",
+]
 
 # From Booster SDK b1_api_const.hpp::JointIndex (kJointCnt = 23)
 B1_JOINT_NAMES: list[str] = [
@@ -149,7 +252,31 @@ B1_JOINT_NAMES: list[str] = [
 
 class SpeakRequest(BaseModel):
     text: str = Field(min_length=1, max_length=500)
+    llm_backend: str | None = None
+    llm_model: str | None = None
     voice_type: str | None = None
+    speech_backend: str | None = None
+    tts_enabled: bool = True
+    piper_rate: float | None = Field(default=None, ge=0.5, le=2.0)
+    piper_noise_scale: float | None = Field(default=None, ge=0.1, le=2.0)
+    piper_noise_w: float | None = Field(default=None, ge=0.1, le=2.0)
+    piper_sentence_silence: float | None = Field(default=None, ge=0.0, le=2.0)
+    apple_rate: float | None = Field(default=None, ge=0.5, le=2.0)
+    playback_target: str | None = None
+
+
+class PreloadRequest(BaseModel):
+    llm_backend: str | None = None
+    llm_model: str | None = None
+    voice_type: str | None = None
+    speech_backend: str | None = None
+    tts_enabled: bool = True
+    piper_rate: float | None = Field(default=None, ge=0.5, le=2.0)
+    piper_noise_scale: float | None = Field(default=None, ge=0.1, le=2.0)
+    piper_noise_w: float | None = Field(default=None, ge=0.1, le=2.0)
+    piper_sentence_silence: float | None = Field(default=None, ge=0.0, le=2.0)
+    apple_rate: float | None = Field(default=None, ge=0.5, le=2.0)
+    playback_target: str | None = None
 
 
 class VolumeRequest(BaseModel):
@@ -158,6 +285,7 @@ class VolumeRequest(BaseModel):
 
 class MicrophoneRequest(BaseModel):
     enabled: bool
+    source: str | None = None
 
 
 class CommandRequest(BaseModel):
@@ -180,6 +308,14 @@ class WebAppState:
         self.ai_chat_error: str | None = None
         self.ai_voice_type: str | None = None
         self.mic_enabled: bool = False
+        self.mic_source: str = "robot"
+        self.mic_worker_thread: threading.Thread | None = None
+        self.mic_worker_stop = threading.Event()
+        self.mic_worker_proc: subprocess.Popen[bytes] | None = None
+        self.mic_worker_running: bool = False
+        self.mic_last_text: str = ""
+        self.mic_last_error: str | None = None
+        self.mic_last_ts: float = 0.0
         self.motors_cache: list[dict[str, Any]] = []
         self.motors_cache_source: str = "/low_state"
         self.motors_cache_error: str | None = None
@@ -188,6 +324,7 @@ class WebAppState:
         self.audio_active: bool = False
         self.audio_error: str | None = None
         self.audio_ts: float = 0.0
+        self.audio_source: str = "robot"
         self.audio_capture_lock = threading.Lock()
         self.debug_lock = threading.Lock()
         self.debug_lines: deque[tuple[int, str]] = deque(maxlen=max(100, DEBUG_LOG_MAX_LINES))
@@ -196,6 +333,12 @@ class WebAppState:
 
 state = WebAppState()
 app = FastAPI(title="Booster K1 Camera Viewer")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 static_dir = Path(__file__).resolve().parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -226,6 +369,7 @@ def _startup() -> None:
     state.ai_chat_error = speech_error
     state.ai_voice_type = speech_voice
     state.mic_enabled = False
+    state.mic_source = "robot"
     if speech_ready:
         _debug_log(f"speech pipeline ready: model={OPENAI_MODEL}, voice={speech_voice}")
     else:
@@ -234,6 +378,7 @@ def _startup() -> None:
 
 @app.on_event("shutdown")
 def _shutdown() -> None:
+    _stop_microphone_worker()
     if not ROS_AVAILABLE:
         return
 
@@ -267,6 +412,18 @@ def health() -> dict[str, Any]:
         volume_source = "bashrc:vol_default"
 
     speech_ready, speech_error, speech_voice = _speech_ready_state()
+    health_tts_backend = _normalize_tts_backend(DEFAULT_TTS_BACKEND)
+    if speech_ready and health_tts_backend == "piper":
+        piper_ready, _ = _piper_ready_state()
+        if not piper_ready:
+            health_tts_backend = "openai"
+    mic_enabled = state.mic_enabled
+    mic_source = state.mic_source
+    if REMOTE_ASSISTANT_BASE_URL:
+        remote_mic, _remote_mic_err = _proxy_remote_assistant_get("/api/microphone/status")
+        if isinstance(remote_mic, dict):
+            mic_enabled = bool(remote_mic.get("enabled"))
+            mic_source = _normalize_mic_source(remote_mic.get("source"))
     return {
         "ok": True,
         "ros_available": ROS_AVAILABLE,
@@ -285,7 +442,10 @@ def health() -> dict[str, Any]:
         "ai_starting": False,
         "ai_error": speech_error,
         "ai_voice_type": speech_voice,
-        "mic_enabled": False,
+        "ai_tts_backend": health_tts_backend,
+        "ai_llm_backend": _normalize_llm_backend(DEFAULT_LLM_BACKEND),
+        "mic_enabled": mic_enabled,
+        "mic_source": mic_source,
         "motors_count": len(state.motors_cache),
         "motors_error": state.motors_cache_error,
         "mode_ui_state": state.mode_ui_state,
@@ -296,9 +456,23 @@ def health() -> dict[str, Any]:
             "prep_value": PREP_MODE_VALUE,
         },
         "tts_control": {
+            "default_backend": _normalize_tts_backend(DEFAULT_TTS_BACKEND),
+            "openai_tts_model": OPENAI_TTS_MODEL,
+            "openai_tts_default_voice": OPENAI_TTS_DEFAULT_VOICE,
+            "apple_tts_default_voice": APPLE_TTS_DEFAULT_VOICE,
+            "kokoro_repo_id": KOKORO_REPO_ID,
+            "kokoro_default_voice": KOKORO_DEFAULT_VOICE,
             "piper_length_scale": PIPER_LENGTH_SCALE or None,
             "piper_espeak_voice": PIPER_ESPEAK_VOICE or None,
             "piper_playback_mode": PIPER_PLAYBACK_MODE,
+            "robot_audio_host": ROBOT_AUDIO_SSH_HOST,
+            "robot_audio_dir": ROBOT_AUDIO_DIR,
+        },
+        "llm_control": {
+            "default_backend": _normalize_llm_backend(DEFAULT_LLM_BACKEND),
+            "openai_model": OPENAI_MODEL,
+            "ollama_api_url": OLLAMA_API_URL,
+            "ollama_model": OLLAMA_MODEL,
         },
     }
 
@@ -310,16 +484,61 @@ def debug_lines(since: int = Query(default=0, ge=0), limit: int = Query(default=
 
 
 @app.get("/api/audio/activity")
-def audio_activity() -> dict[str, Any]:
-    level, active, error = _read_audio_activity_cached()
+def audio_activity(source: str | None = Query(default=None)) -> dict[str, Any]:
+    _load_env_file()
+    mic_source = _normalize_mic_source(source)
+    if REMOTE_ASSISTANT_BASE_URL:
+        remote_resp, remote_err = _proxy_remote_assistant_get(f"/api/audio/activity?source={mic_source}")
+        if remote_resp is not None:
+            remote_resp.setdefault("source", mic_source)
+            return remote_resp
+        return {
+            "ok": False,
+            "active": False,
+            "level": 0.0,
+            "threshold": 0.02,
+            "device": f"remote {mic_source} capture",
+            "source": mic_source,
+            "error": remote_err or "remote assistant unavailable",
+        }
+    level, active, error = _read_audio_activity_cached(mic_source)
+    device_name = (
+        "sounddevice default capture"
+        if mic_source == "mac"
+        else (
+            f"ssh robot capture ({ROBOT_AUDIO_SSH_HOST})"
+            if sys.platform == "darwin" and ROBOT_AUDIO_SSH_HOST
+            else "ALSA default capture"
+        )
+    )
     return {
         "ok": error is None,
         "active": active,
         "level": level,
         "threshold": 0.02,
-        "device": "ALSA default capture",
+        "device": device_name,
+        "source": mic_source,
         "error": error,
     }
+
+
+@app.get("/api/microphone/status")
+def microphone_status() -> dict[str, Any]:
+    _load_env_file()
+    if REMOTE_ASSISTANT_BASE_URL:
+        remote_resp, remote_err = _proxy_remote_assistant_get("/api/microphone/status")
+        if remote_resp is not None:
+            return remote_resp
+        return {
+            "ok": False,
+            "enabled": False,
+            "source": state.mic_source,
+            "listening": False,
+            "transcript": "",
+            "updated_at": state.mic_last_ts,
+            "error": remote_err or "remote assistant unavailable",
+        }
+    return _microphone_status_payload()
 
 
 @app.post("/api/command")
@@ -366,60 +585,337 @@ def speak(req: SpeakRequest) -> dict[str, Any]:
         return {"ok": False, "error": "text is empty"}
 
     _load_env_file()
+    remote_resp, remote_err = _proxy_remote_assistant("/api/speak", _model_dump_json(req))
+    if remote_resp is not None:
+        remote_resp.setdefault("remote_assistant_source", REMOTE_ASSISTANT_BASE_URL)
+        return remote_resp
+    if remote_err:
+        _debug_log(f"remote assistant proxy failed: {remote_err}")
+        return {"ok": False, "error": f"Remote assistant error: {remote_err}"}
+
+    llm_backend = _normalize_llm_backend(req.llm_backend or DEFAULT_LLM_BACKEND)
+    tts_backend = _normalize_tts_backend(req.speech_backend or DEFAULT_TTS_BACKEND)
+    tts_enabled = bool(req.tts_enabled)
+    llm_model = (req.llm_model or "").strip() or (OPENAI_MODEL if llm_backend == "openai" else OLLAMA_MODEL)
     api_key = _resolve_openai_api_key()
-    if not api_key:
+    if tts_enabled and tts_backend == "openai" and not api_key:
         return {
             "ok": False,
-            "error": "OpenAI API key missing (set OPENAI_API_KEY or CHATGPT_API_KEY in .env/environment)",
+            "error": "OpenAI API key missing for OpenAI Voice (set OPENAI_API_KEY or CHATGPT_API_KEY in .env/environment)",
         }
 
-    system_prompt = os.environ.get("CHATGPT_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT).strip() or DEFAULT_SYSTEM_PROMPT
-    assistant_text, llm_error = _query_openai_response(
-        api_key=api_key,
-        prompt=user_text,
-        system_prompt=system_prompt,
-        model=OPENAI_MODEL,
-    )
-    if llm_error:
-        _debug_log(f"openai query failed: {llm_error}")
-        return {"ok": False, "error": f"OpenAI error: {llm_error}"}
-
-    if not assistant_text:
-        return {"ok": False, "error": "OpenAI returned empty response"}
-
-    tts_text = _prepare_tts_text(assistant_text)
-    voice = (req.voice_type or "").strip() or DEFAULT_PIPER_VOICE
-    ok, error, voice_id, audio_b64, playback_mode = _speak_with_piper(tts_text, voice)
-    if not ok:
-        _debug_log(f"piper speak failed: {error}")
+    memory_reply = maybe_handle_memory_command(user_text)
+    if memory_reply:
+        assistant_text = memory_reply
+        append_history_turn(user_text, assistant_text, llm_backend=llm_backend, llm_model=llm_model)
+        if not tts_enabled:
+            return {
+                "ok": True,
+                "llm_backend_used": "memory",
+                "llm_model_used": "local-memory",
+                "speech_backend_used": None,
+                "voice_used": None,
+                "assistant_text": assistant_text,
+                "tts_text": None,
+                "user_text": user_text,
+                "tts_enabled": False,
+                "playback_target": None,
+                "playback_mode": "none",
+                "audio_mime": None,
+                "audio_base64": None,
+                "piper_rate": None,
+                "piper_noise_scale": None,
+                "piper_noise_w": None,
+                "piper_sentence_silence": None,
+                "apple_rate": None,
+            }
+        tts_text = _prepare_tts_text(assistant_text)
+        voice = (req.voice_type or "").strip() or _default_voice_for_backend(tts_backend)
+        playback_target = _normalize_playback_target(req.playback_target)
+        ok, error, voice_id, audio_b64, playback_mode = _speak_with_backend(
+            backend=tts_backend,
+            voice=voice,
+            text=tts_text,
+            playback_target=playback_target,
+            piper_rate=req.piper_rate,
+            piper_noise_scale=req.piper_noise_scale,
+            piper_noise_w=req.piper_noise_w,
+            piper_sentence_silence=req.piper_sentence_silence,
+            apple_rate=req.apple_rate,
+            api_key=api_key,
+        )
+        if not ok:
+            return {
+                "ok": False,
+                "error": error,
+                "llm_backend_used": "memory",
+                "llm_model_used": "local-memory",
+                "speech_backend_used": tts_backend,
+                "voice_used": voice_id,
+                "assistant_text": assistant_text,
+                "tts_text": tts_text,
+                "playback_target": playback_target,
+                "playback_mode": playback_mode,
+                "piper_rate": req.piper_rate if tts_backend == "piper" else None,
+                "piper_noise_scale": req.piper_noise_scale if tts_backend == "piper" else None,
+                "piper_noise_w": req.piper_noise_w if tts_backend == "piper" else None,
+                "piper_sentence_silence": req.piper_sentence_silence if tts_backend == "piper" else None,
+                "apple_rate": req.apple_rate if tts_backend == "apple" else None,
+            }
         return {
-            "ok": False,
-            "error": error,
+            "ok": True,
+            "llm_backend_used": "memory",
+            "llm_model_used": "local-memory",
+            "speech_backend_used": tts_backend,
             "voice_used": voice_id,
             "assistant_text": assistant_text,
             "tts_text": tts_text,
+            "user_text": user_text,
+            "tts_enabled": True,
+            "playback_target": playback_target,
             "playback_mode": playback_mode,
+            "audio_mime": "audio/wav" if audio_b64 else None,
+            "audio_base64": audio_b64,
+            "piper_rate": req.piper_rate if tts_backend == "piper" else None,
+            "piper_noise_scale": req.piper_noise_scale if tts_backend == "piper" else None,
+            "piper_noise_w": req.piper_noise_w if tts_backend == "piper" else None,
+            "piper_sentence_silence": req.piper_sentence_silence if tts_backend == "piper" else None,
+            "apple_rate": req.apple_rate if tts_backend == "apple" else None,
+        }
+
+    capture_implicit_memory(user_text)
+    system_prompt = _resolve_system_prompt(llm_backend)
+    llm_model_used = llm_model
+    if llm_backend == "openai":
+        llm_prompt = build_prompt_with_context(user_text, llm_backend=llm_backend, llm_model=llm_model)
+        if not api_key:
+            return {
+                "ok": False,
+                "error": "OpenAI API key missing for OpenAI chat (set OPENAI_API_KEY or CHATGPT_API_KEY in .env/environment)",
+            }
+        assistant_text, llm_error, llm_thinking = _query_openai_response(
+            api_key=api_key,
+            prompt=llm_prompt,
+            system_prompt=system_prompt,
+            model=llm_model,
+        )
+    else:
+        llm_messages = build_chat_messages_with_context(user_text, llm_backend=llm_backend, llm_model=llm_model)
+        assistant_text, llm_error, llm_thinking = _query_ollama_response(
+            prompt=None,
+            system_prompt=system_prompt,
+            model=llm_model,
+            messages=llm_messages,
+        )
+    if llm_error:
+        _debug_log(f"{llm_backend} query failed: {llm_error}")
+        backend_label = "OpenAI" if llm_backend == "openai" else "Ollama"
+        return {"ok": False, "error": f"{backend_label} error: {llm_error}"}
+
+    if not assistant_text:
+        backend_label = "OpenAI" if llm_backend == "openai" else "Ollama"
+        return {"ok": False, "error": f"{backend_label} returned empty response"}
+
+    append_history_turn(user_text, assistant_text, llm_backend=llm_backend, llm_model=llm_model)
+    if not tts_enabled:
+        return {
+            "ok": True,
+            "llm_backend_used": llm_backend,
+            "llm_model_used": llm_model_used,
+            "llm_thinking": llm_thinking,
+            "speech_backend_used": None,
+            "voice_used": None,
+            "assistant_text": assistant_text,
+            "tts_text": None,
+            "user_text": user_text,
+            "tts_enabled": False,
+            "playback_target": None,
+            "playback_mode": "none",
+            "audio_mime": None,
+            "audio_base64": None,
+            "piper_rate": None,
+            "piper_noise_scale": None,
+            "piper_noise_w": None,
+            "piper_sentence_silence": None,
+            "apple_rate": None,
+        }
+
+    tts_text = _prepare_tts_text(assistant_text)
+    voice = (req.voice_type or "").strip() or _default_voice_for_backend(tts_backend)
+    playback_target = _normalize_playback_target(req.playback_target)
+    ok, error, voice_id, audio_b64, playback_mode = _speak_with_backend(
+        backend=tts_backend,
+        voice=voice,
+        text=tts_text,
+        playback_target=playback_target,
+        piper_rate=req.piper_rate,
+        piper_noise_scale=req.piper_noise_scale,
+        piper_noise_w=req.piper_noise_w,
+        piper_sentence_silence=req.piper_sentence_silence,
+        apple_rate=req.apple_rate,
+        api_key=api_key,
+    )
+    if not ok:
+        _debug_log(f"{tts_backend} speak failed: {error}")
+        return {
+            "ok": False,
+            "error": error,
+            "llm_backend_used": llm_backend,
+            "llm_model_used": llm_model_used,
+            "speech_backend_used": tts_backend,
+            "voice_used": voice_id,
+            "assistant_text": assistant_text,
+            "tts_text": tts_text,
+            "playback_target": playback_target,
+            "playback_mode": playback_mode,
+            "piper_rate": req.piper_rate if tts_backend == "piper" else None,
+            "piper_noise_scale": req.piper_noise_scale if tts_backend == "piper" else None,
+            "piper_noise_w": req.piper_noise_w if tts_backend == "piper" else None,
+            "piper_sentence_silence": req.piper_sentence_silence if tts_backend == "piper" else None,
+            "apple_rate": req.apple_rate if tts_backend == "apple" else None,
         }
     return {
         "ok": True,
+        "llm_backend_used": llm_backend,
+        "llm_model_used": llm_model_used,
+        "llm_thinking": llm_thinking,
+        "speech_backend_used": tts_backend,
         "voice_used": voice_id,
         "assistant_text": assistant_text,
         "tts_text": tts_text,
         "user_text": user_text,
+        "tts_enabled": True,
+        "playback_target": playback_target,
         "playback_mode": playback_mode,
         "audio_mime": "audio/wav" if audio_b64 else None,
         "audio_base64": audio_b64,
+        "piper_rate": req.piper_rate if tts_backend == "piper" else None,
+        "piper_noise_scale": req.piper_noise_scale if tts_backend == "piper" else None,
+        "piper_noise_w": req.piper_noise_w if tts_backend == "piper" else None,
+        "piper_sentence_silence": req.piper_sentence_silence if tts_backend == "piper" else None,
+        "apple_rate": req.apple_rate if tts_backend == "apple" else None,
+    }
+
+
+@app.post("/api/preload")
+def preload(req: PreloadRequest) -> dict[str, Any]:
+    _load_env_file()
+    remote_resp, remote_err = _proxy_remote_assistant("/api/preload", _model_dump_json(req))
+    if remote_resp is not None:
+        remote_resp.setdefault("remote_assistant_source", REMOTE_ASSISTANT_BASE_URL)
+        return remote_resp
+    if remote_err:
+        _debug_log(f"remote preload proxy failed: {remote_err}")
+        return {"ok": False, "error": f"Remote assistant error: {remote_err}"}
+
+    llm_backend = _normalize_llm_backend(req.llm_backend or DEFAULT_LLM_BACKEND)
+    llm_model = (req.llm_model or "").strip() or (OPENAI_MODEL if llm_backend == "openai" else OLLAMA_MODEL)
+    tts_backend = _normalize_tts_backend(req.speech_backend or DEFAULT_TTS_BACKEND)
+    tts_enabled = bool(req.tts_enabled)
+    playback_target = _normalize_playback_target(req.playback_target)
+    api_key = _resolve_openai_api_key()
+
+    if llm_backend == "openai" and not api_key:
+        return {
+            "ok": False,
+            "error": "OpenAI API key missing for OpenAI chat (set OPENAI_API_KEY or CHATGPT_API_KEY in .env/environment)",
+        }
+    if tts_enabled and tts_backend == "openai" and not api_key:
+        return {
+            "ok": False,
+            "error": "OpenAI API key missing for OpenAI Voice (set OPENAI_API_KEY or CHATGPT_API_KEY in .env/environment)",
+        }
+
+    if llm_backend == "ollama":
+        _debug_log(f"preloading ollama model: {llm_model}")
+        _, llm_error, llm_thinking = _query_ollama_response(
+            prompt="Reply with exactly: ok",
+            system_prompt=_resolve_system_prompt(llm_backend) + "\n\nThis is a warmup request. Reply with exactly ok.",
+            model=llm_model,
+        )
+        if llm_error:
+            return {
+                "ok": False,
+                "error": f"Ollama preload error: {llm_error}",
+                "llm_backend_used": llm_backend,
+                "llm_model_used": llm_model,
+            }
+    else:
+        llm_thinking = None
+
+    if not tts_enabled:
+        return {
+            "ok": True,
+            "llm_backend_used": llm_backend,
+            "llm_model_used": llm_model,
+            "llm_thinking": llm_thinking,
+            "speech_backend_used": None,
+            "voice_used": None,
+            "tts_enabled": False,
+            "playback_target": None,
+            "playback_mode": "none",
+            "audio_mime": None,
+            "audio_base64": None,
+            "message": "Model loaded.",
+        }
+
+    voice = (req.voice_type or "").strip() or _default_voice_for_backend(tts_backend)
+    ok, error, voice_id, audio_b64, playback_mode = _speak_with_backend(
+        backend=tts_backend,
+        voice=voice,
+        text="Model loaded.",
+        playback_target=playback_target,
+        piper_rate=req.piper_rate,
+        piper_noise_scale=req.piper_noise_scale,
+        piper_noise_w=req.piper_noise_w,
+        piper_sentence_silence=req.piper_sentence_silence,
+        apple_rate=req.apple_rate,
+        api_key=api_key,
+    )
+    if not ok:
+        _debug_log(f"{tts_backend} preload speak failed: {error}")
+        return {
+            "ok": False,
+            "error": error,
+            "llm_backend_used": llm_backend,
+            "llm_model_used": llm_model,
+            "speech_backend_used": tts_backend,
+            "voice_used": voice_id,
+            "tts_enabled": True,
+            "playback_target": playback_target,
+            "playback_mode": playback_mode,
+            "piper_rate": req.piper_rate if tts_backend == "piper" else None,
+            "piper_noise_scale": req.piper_noise_scale if tts_backend == "piper" else None,
+            "piper_noise_w": req.piper_noise_w if tts_backend == "piper" else None,
+            "piper_sentence_silence": req.piper_sentence_silence if tts_backend == "piper" else None,
+            "apple_rate": req.apple_rate if tts_backend == "apple" else None,
+        }
+
+    return {
+        "ok": True,
+        "llm_backend_used": llm_backend,
+        "llm_model_used": llm_model,
+        "llm_thinking": llm_thinking,
+        "speech_backend_used": tts_backend,
+        "voice_used": voice_id,
+        "tts_enabled": True,
+        "tts_text": "Model loaded.",
+        "playback_target": playback_target,
+        "playback_mode": playback_mode,
+        "audio_mime": "audio/wav" if audio_b64 else None,
+        "audio_base64": audio_b64,
+        "message": "Model loaded.",
+        "piper_rate": req.piper_rate if tts_backend == "piper" else None,
+        "piper_noise_scale": req.piper_noise_scale if tts_backend == "piper" else None,
+        "piper_noise_w": req.piper_noise_w if tts_backend == "piper" else None,
+        "piper_sentence_silence": req.piper_sentence_silence if tts_backend == "piper" else None,
+        "apple_rate": req.apple_rate if tts_backend == "apple" else None,
     }
 
 
 @app.get("/api/voices")
 def voices() -> dict[str, Any]:
-    return {
-        "ok": True,
-        "voice_dir": str(PIPER_VOICE_DIR),
-        "default_voice": DEFAULT_PIPER_VOICE,
-        "voices": _list_piper_voice_ids(),
-    }
+    return _build_voices_payload()
 
 
 @app.get("/api/volume")
@@ -441,6 +937,9 @@ def get_volume() -> dict[str, Any]:
 def set_volume(req: VolumeRequest) -> dict[str, Any]:
     ok, source, error = _set_volume_percent(req.percent)
     percent, read_source = _read_volume_percent()
+    if ok and percent is None:
+        percent = max(0, min(100, int(req.percent)))
+        read_source = "requested:fallback"
     return {
         "ok": ok,
         "requested_percent": req.percent,
@@ -453,11 +952,32 @@ def set_volume(req: VolumeRequest) -> dict[str, Any]:
 
 @app.post("/api/microphone")
 def set_microphone(req: MicrophoneRequest) -> dict[str, Any]:
-    _debug_log("microphone toggle rejected: speech engine disabled")
+    _load_env_file()
+    mic_source = _normalize_mic_source(req.source)
+    state.mic_source = mic_source
+    if REMOTE_ASSISTANT_BASE_URL:
+        remote_resp, remote_err = _proxy_remote_assistant("/api/microphone", _model_dump_json(req))
+        if remote_resp is not None:
+            remote_resp.setdefault("source", mic_source)
+            return remote_resp
+        return {
+            "ok": False,
+            "enabled": False,
+            "source": mic_source,
+            "error": remote_err or "remote assistant unavailable",
+        }
+
+    state.mic_enabled = bool(req.enabled)
+    if state.mic_enabled:
+        _start_microphone_worker(mic_source)
+    else:
+        _stop_microphone_worker()
+    _debug_log(f"microphone state updated: source={mic_source} enabled={state.mic_enabled}")
     return {
-        "ok": False,
-        "enabled": False,
-        "error": "speech engine disabled",
+        "ok": True,
+        "enabled": state.mic_enabled,
+        "source": mic_source,
+        "note": f"Audio capture source set to {mic_source}. Sherpa transcription is running on the Mac and updates the Heard box only.",
     }
 
 
@@ -498,6 +1018,179 @@ def _truncate_debug(text: str, max_chars: int = 2000) -> str:
     if len(text) <= max_chars:
         return text
     return text[:max_chars] + f"... [truncated {len(text) - max_chars} chars]"
+
+
+def _microphone_status_payload() -> dict[str, Any]:
+    label = "Mac mic" if state.mic_source == "mac" else "Robot mic"
+    return {
+        "ok": True,
+        "enabled": state.mic_enabled,
+        "source": state.mic_source,
+        "label": label,
+        "listening": state.mic_enabled and state.mic_worker_running,
+        "transcript": state.mic_last_text,
+        "updated_at": state.mic_last_ts,
+        "error": state.mic_last_error,
+    }
+
+
+def _set_microphone_result(text: str = "", error: str | None = None) -> None:
+    state.mic_last_text = (text or "").strip()
+    state.mic_last_error = error
+    state.mic_last_ts = time.time()
+
+
+def _terminate_microphone_process() -> None:
+    proc = state.mic_worker_proc
+    if proc is None:
+        return
+    state.mic_worker_proc = None
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            proc.wait(timeout=1.5)
+    except Exception:
+        try:
+            proc.kill()
+            proc.wait(timeout=1.0)
+        except Exception:
+            pass
+
+
+def _stop_microphone_worker() -> None:
+    state.mic_enabled = False
+    state.mic_worker_stop.set()
+    _terminate_microphone_process()
+    thread = state.mic_worker_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=2.0)
+    state.mic_worker_thread = None
+    state.mic_worker_running = False
+
+
+def _start_microphone_worker(source: str) -> None:
+    _stop_microphone_worker()
+    state.mic_enabled = True
+    state.mic_source = source
+    state.mic_worker_stop = threading.Event()
+    _set_microphone_result("", None)
+    thread = threading.Thread(target=_microphone_worker_loop, args=(source, state.mic_worker_stop), daemon=True)
+    state.mic_worker_thread = thread
+    thread.start()
+
+
+def _microphone_worker_loop(source: str, stop_event: threading.Event) -> None:
+    state.mic_worker_running = True
+    label = "Mac mic" if source == "mac" else "Robot mic"
+    _debug_log(f"sherpa listen loop started: source={source}")
+    try:
+        while not stop_event.is_set() and state.mic_enabled and state.mic_source == source:
+            transcript, error = _run_sherpa_once(source, stop_event)
+            if stop_event.is_set() or not state.mic_enabled or state.mic_source != source:
+                break
+            if transcript:
+                _set_microphone_result(transcript, None)
+                _debug_log(f"heard ({label}): {transcript}")
+                continue
+            if error and error not in ("no speech recognized before timeout", "stopped"):
+                _set_microphone_result(state.mic_last_text, error)
+                _debug_log(f"sherpa listen warning ({source}): {error}")
+                time.sleep(0.35)
+    finally:
+        state.mic_worker_running = False
+        _terminate_microphone_process()
+        _debug_log(f"sherpa listen loop stopped: source={source}")
+
+
+def _build_robot_audio_capture_command() -> str:
+    robot_devices = [
+        "plughw:CARD=Device,DEV=0",
+        "dsnoop:CARD=Device,DEV=0",
+        "hw:CARD=Device,DEV=0",
+        "default",
+    ]
+    attempts = " || ".join(
+        [
+            (
+                f"timeout {max(1.0, SHERPA_STT_MAX_SECONDS):.1f} "
+                f"arecord -q -D {shlex.quote(dev)} -f S16_LE -c 1 -r 16000 -t raw"
+            )
+            for dev in robot_devices
+        ]
+    )
+    remote_cmd = f"bash -lc {shlex.quote(attempts)}"
+    return " ".join(
+        [
+            "ssh",
+            "-p",
+            shlex.quote(str(ROBOT_AUDIO_SSH_PORT)),
+            f"{shlex.quote(ROBOT_AUDIO_SSH_USER)}@{shlex.quote(ROBOT_AUDIO_SSH_HOST)}",
+            shlex.quote(remote_cmd),
+        ]
+    )
+
+
+def _run_sherpa_once(source: str, stop_event: threading.Event) -> tuple[str, str | None]:
+    if not SHERPA_ASR_SCRIPT.exists():
+        return "", f"sherpa script missing: {SHERPA_ASR_SCRIPT}"
+    if not SHERPA_ASR_MODEL_DIR.is_dir():
+        return "", f"sherpa model dir missing: {SHERPA_ASR_MODEL_DIR}"
+
+    if source == "mac":
+        cmd = [
+            sys.executable,
+            str(SHERPA_ASR_SCRIPT),
+            "--model-dir",
+            str(SHERPA_ASR_MODEL_DIR),
+            "--max-seconds",
+            str(SHERPA_STT_MAX_SECONDS),
+        ]
+        if SHERPA_DEVICE_NAME:
+            cmd.extend(["--device-name", SHERPA_DEVICE_NAME])
+    else:
+        if not ROBOT_AUDIO_SSH_HOST:
+            return "", "robot ssh host not configured"
+        sherpa_cmd = " ".join(
+            [
+                shlex.quote(sys.executable),
+                shlex.quote(str(SHERPA_ASR_SCRIPT)),
+                "--stdin-pcm",
+                "--sample-rate",
+                "16000",
+                "--model-dir",
+                shlex.quote(str(SHERPA_ASR_MODEL_DIR)),
+                "--max-seconds",
+                shlex.quote(str(SHERPA_STT_MAX_SECONDS)),
+            ]
+        )
+        shell_cmd = f"{_build_robot_audio_capture_command()} | {sherpa_cmd}"
+        cmd = ["bash", "-lc", shell_cmd]
+
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except Exception as exc:
+        return "", str(exc)
+
+    state.mic_worker_proc = proc
+    try:
+        while proc.poll() is None:
+            if stop_event.is_set() or not state.mic_enabled or state.mic_source != source:
+                _terminate_microphone_process()
+                return "", "stopped"
+            time.sleep(0.1)
+        stdout, stderr = proc.communicate(timeout=0.5)
+    except Exception as exc:
+        _terminate_microphone_process()
+        return "", str(exc)
+    finally:
+        state.mic_worker_proc = None
+
+    out_text = (stdout or b"").decode("utf-8", errors="ignore").strip()
+    err_text = (stderr or b"").decode("utf-8", errors="ignore").strip()
+    for line in out_text.splitlines():
+        if line.startswith("__STT__:"):
+            return line.split(":", 1)[1].strip(), None
+    return "", err_text or out_text or f"sherpa exited with code {proc.returncode}"
 
 
 def _read_battery_text(name: str) -> str | None:
@@ -857,31 +1550,37 @@ def _run_shell(
     return proc.returncode, out
 
 
-def _read_audio_activity_cached() -> tuple[float, bool, str | None]:
+def _read_audio_activity_cached(source: str = "robot") -> tuple[float, bool, str | None]:
     if not AUDIO_ACTIVITY_ENABLED:
         return 0.0, False, "audio activity disabled"
 
     now = time.monotonic()
-    if (now - state.audio_ts) < 0.35:
+    if state.audio_source == source and (now - state.audio_ts) < 0.35:
         return state.audio_level, state.audio_active, state.audio_error
 
     if not state.audio_capture_lock.acquire(blocking=False):
         # Another request is already sampling audio; use latest cached snapshot.
         return state.audio_level, state.audio_active, state.audio_error
     try:
-        level, error = _read_audio_level_once()
+        level, error = _read_audio_level_once(source)
         active = level >= 0.02
         state.audio_level = level
         state.audio_active = active
         state.audio_error = error
         state.audio_ts = now
+        state.audio_source = source
         return level, active, error
     finally:
         state.audio_capture_lock.release()
 
 
 
-def _read_audio_level_once() -> tuple[float, str | None]:
+def _read_audio_level_once(source: str = "robot") -> tuple[float, str | None]:
+    if source == "mac" and sys.platform == "darwin" and shutil.which("arecord") is None:
+        return _read_audio_level_once_sounddevice()
+    if source == "robot" and sys.platform == "darwin":
+        return _read_audio_level_once_robot_over_ssh()
+
     devices = [
         "default",
         "plughw:CARD=XFMDPV0018,DEV=0",
@@ -928,6 +1627,87 @@ def _read_audio_level_once() -> tuple[float, str | None]:
     return max(0.0, min(1.0, level)), None
 
 
+def _read_audio_level_once_robot_over_ssh() -> tuple[float, str | None]:
+    if not ROBOT_AUDIO_SSH_HOST:
+        return 0.0, "robot ssh host not configured"
+
+    robot_devices = [
+        "plughw:CARD=Device,DEV=0",
+        "dsnoop:CARD=Device,DEV=0",
+        "hw:CARD=Device,DEV=0",
+        "default",
+    ]
+    attempts = " || ".join(
+        [
+            f"timeout 0.35 arecord -q -D {shlex.quote(dev)} -f S16_LE -c 1 -r 8000 -t raw"
+            for dev in robot_devices
+        ]
+    )
+    remote_cmd = f"bash -lc {shlex.quote(attempts)}"
+    ssh_cmd = [
+        "ssh",
+        "-p",
+        str(ROBOT_AUDIO_SSH_PORT),
+        f"{ROBOT_AUDIO_SSH_USER}@{ROBOT_AUDIO_SSH_HOST}",
+        remote_cmd,
+    ]
+    try:
+        proc = subprocess.run(
+            ssh_cmd,
+            capture_output=True,
+            timeout=4.0,
+            check=False,
+        )
+    except Exception as exc:
+        return 0.0, str(exc)
+    data = proc.stdout or b""
+    if len(data) < 4:
+        err_text = (proc.stderr or b"").decode("utf-8", errors="ignore").strip()
+        return 0.0, err_text or "no capture data"
+
+    nbytes = (len(data) // 2) * 2
+    if nbytes <= 0:
+        return 0.0, "invalid capture data"
+
+    total_abs = 0
+    count = 0
+    for (sample,) in struct.iter_unpack("<h", data[:nbytes]):
+        total_abs += abs(int(sample))
+        count += 1
+    if count == 0:
+        return 0.0, "empty sample set"
+    level = float(total_abs) / float(count) / 32768.0
+    return max(0.0, min(1.0, level)), None
+
+
+def _read_audio_level_once_sounddevice() -> tuple[float, str | None]:
+    try:
+        import numpy as np
+        import sounddevice as sd
+    except Exception as exc:
+        return 0.0, f"sounddevice unavailable: {exc}"
+
+    sample_rate = 8000
+    duration_sec = 0.25
+    frames = max(1, int(sample_rate * duration_sec))
+    try:
+        data = sd.rec(frames, samplerate=sample_rate, channels=1, dtype="float32")
+        sd.wait()
+    except Exception as exc:
+        return 0.0, str(exc)
+
+    if data is None or getattr(data, "size", 0) == 0:
+        return 0.0, "no capture data"
+    try:
+        arr = np.asarray(data, dtype=np.float32).reshape(-1)
+    except Exception as exc:
+        return 0.0, f"invalid capture data: {exc}"
+    if arr.size == 0:
+        return 0.0, "empty sample set"
+    level = float(np.mean(np.abs(arr)))
+    return max(0.0, min(1.0, level)), None
+
+
 def _load_env_file() -> None:
     env_path = Path(__file__).resolve().parents[3] / ".env"
     if not env_path.exists():
@@ -958,20 +1738,350 @@ def _resolve_openai_api_key() -> str:
     return ""
 
 
+def _resolve_prompt_from_env(
+    file_env_name: str,
+    inline_env_name: str,
+    default_prompt: str,
+) -> str:
+    prompt_file = os.environ.get(file_env_name, "").strip()
+    if prompt_file:
+        prompt_path = Path(prompt_file)
+        if not prompt_path.is_absolute():
+            prompt_path = Path(__file__).resolve().parents[3] / prompt_path
+        try:
+            text = prompt_path.read_text(encoding="utf-8").strip()
+            if text:
+                return text
+        except Exception as exc:
+            _debug_log(f"system prompt file read failed: {prompt_path} ({exc})")
+    inline_prompt = os.environ.get(inline_env_name, "").strip()
+    return inline_prompt or default_prompt
+
+
+def _resolve_system_prompt(llm_backend: str = "openai") -> str:
+    normalized = _normalize_llm_backend(llm_backend)
+    if normalized == "ollama":
+        return _resolve_prompt_from_env(
+            "OLLAMA_SYSTEM_PROMPT_FILE",
+            "OLLAMA_SYSTEM_PROMPT",
+            _resolve_prompt_from_env(
+                "CHATGPT_SYSTEM_PROMPT_FILE",
+                "CHATGPT_SYSTEM_PROMPT",
+                DEFAULT_SYSTEM_PROMPT,
+            ),
+        )
+    return _resolve_prompt_from_env(
+        "CHATGPT_SYSTEM_PROMPT_FILE",
+        "CHATGPT_SYSTEM_PROMPT",
+        DEFAULT_SYSTEM_PROMPT,
+    )
+
+
 def _speech_ready_state() -> tuple[bool, str | None, str | None]:
-    piper_ready, piper_error = _piper_ready_state()
-    if not piper_ready:
-        return False, piper_error, None
+    backend = _normalize_tts_backend(DEFAULT_TTS_BACKEND)
     _load_env_file()
+    if backend == "piper":
+        piper_ready, piper_error = _piper_ready_state()
+        if not piper_ready:
+            api_key = _resolve_openai_api_key()
+            if not api_key:
+                return False, piper_error, DEFAULT_PIPER_VOICE
+            return True, None, OPENAI_TTS_DEFAULT_VOICE
+        return True, None, DEFAULT_PIPER_VOICE
+    if backend == "apple":
+        apple_ready, apple_error = _apple_tts_ready_state()
+        if apple_ready:
+            return True, None, APPLE_TTS_DEFAULT_VOICE
+        return False, apple_error, APPLE_TTS_DEFAULT_VOICE
+    if backend == "kokoro":
+        kokoro_ready, kokoro_error = _kokoro_ready_state()
+        if kokoro_ready:
+            return True, None, KOKORO_DEFAULT_VOICE
+        return False, kokoro_error, KOKORO_DEFAULT_VOICE
     api_key = _resolve_openai_api_key()
     if not api_key:
-        return False, "OpenAI API key missing", DEFAULT_PIPER_VOICE
-    return True, None, DEFAULT_PIPER_VOICE
+        return False, "OpenAI API key missing", _default_voice_for_backend(backend)
+    return True, None, OPENAI_TTS_DEFAULT_VOICE
+
+
+def _normalize_tts_backend(raw: str | None) -> str:
+    value = (raw or "").strip().lower()
+    if value in ("openai", "openai-voice", "openai_tts"):
+        return "openai"
+    if value in ("apple", "apple-tts", "macos", "macos-system", "system"):
+        return "apple"
+    if value in ("kokoro", "kokoro-tts"):
+        return "kokoro"
+    return "piper"
+
+
+def _default_voice_for_backend(backend: str) -> str:
+    if backend == "openai":
+        return OPENAI_TTS_DEFAULT_VOICE
+    if backend == "apple":
+        return APPLE_TTS_DEFAULT_VOICE
+    if backend == "kokoro":
+        return KOKORO_DEFAULT_VOICE
+    return DEFAULT_PIPER_VOICE
+
+
+def _normalize_playback_target(raw: str | None) -> str:
+    value = (raw or "").strip().lower()
+    if value in ("robot", "robot-speakers", "robot_speakers"):
+        return "robot"
+    return "browser"
+
+
+def _normalize_llm_backend(raw: str | None) -> str:
+    value = (raw or "").strip().lower()
+    if value in ("ollama", "local", "local-ollama"):
+        return "ollama"
+    return "openai"
+
+
+def _normalize_mic_source(raw: str | None) -> str:
+    value = (raw or "").strip().lower()
+    if value in ("mac", "remote", "assistant"):
+        return "mac"
+    return "robot"
+
+
+def _sanitize_model_reply(text: str | None) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+
+    cleaned = re.sub(r"<think>.*?</think>", "", raw, flags=re.IGNORECASE | re.DOTALL).strip()
+    low = cleaned.lower()
+    analysis_markers = (
+        "sentiment analysis:",
+        "diagnostic check:",
+        "recommendation:",
+        "fix:",
+        "response should",
+    )
+
+    if any(marker in low for marker in analysis_markers):
+        quoted = re.findall(r'"([^"\n]{3,})"', cleaned)
+        if quoted:
+            return quoted[-1].strip()
+
+        useful_lines: list[str] = []
+        for raw_line in cleaned.splitlines():
+            line = raw_line.strip(" -*\t")
+            if not line:
+                continue
+            lowered = line.lower()
+            if any(lowered.startswith(marker) for marker in analysis_markers):
+                continue
+            useful_lines.append(line)
+        if useful_lines:
+            return " ".join(useful_lines).strip()
+
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _sanitize_model_thinking(text: str | None) -> str:
+    raw = (text or "").strip()
+    if not raw:
+        return ""
+    raw = re.sub(r"<think>|</think>", "", raw, flags=re.IGNORECASE)
+    return raw.strip()
+
+
+def _fetch_remote_tts_catalog() -> tuple[dict[str, Any] | None, str | None]:
+    if not REMOTE_TTS_CATALOG_URL:
+        return None, None
+    req = urlrequest.Request(
+        REMOTE_TTS_CATALOG_URL,
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "pc_booster_control/remote-tts-catalog",
+        },
+        method="GET",
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=REMOTE_TTS_CATALOG_TIMEOUT_SEC) as resp:
+            raw = resp.read().decode("utf-8")
+    except urlerror.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        return None, f"HTTP {exc.code}: {body}"
+    except Exception as exc:
+        return None, str(exc)
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        return None, f"invalid JSON: {exc}"
+    if not isinstance(parsed, dict) or parsed.get("ok") is not True:
+        return None, "remote catalog not ok"
+    return parsed, None
+
+
+def _model_dump_json(model: BaseModel) -> dict[str, Any]:
+    if hasattr(model, "model_dump"):
+        return getattr(model, "model_dump")()
+    return model.dict()
+
+
+def _post_remote_json(url: str, payload: dict[str, Any], timeout_sec: int) -> tuple[dict[str, Any] | None, str | None]:
+    req = urlrequest.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "pc_booster_control/remote-assistant",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8")
+    except urlerror.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        return None, f"HTTP {exc.code}: {body}"
+    except Exception as exc:
+        return None, str(exc)
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        return None, f"invalid JSON: {exc}"
+    if not isinstance(parsed, dict):
+        return None, "remote response was not a JSON object"
+    return parsed, None
+
+
+def _get_remote_json(url: str, timeout_sec: int) -> tuple[dict[str, Any] | None, str | None]:
+    req = urlrequest.Request(
+        url,
+        method="GET",
+        headers={
+            "Accept": "application/json",
+            "User-Agent": "pc_booster_control/remote-assistant",
+        },
+    )
+    try:
+        with urlrequest.urlopen(req, timeout=timeout_sec) as resp:
+            raw = resp.read().decode("utf-8")
+    except urlerror.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        return None, f"HTTP {exc.code}: {body}"
+    except Exception as exc:
+        return None, str(exc)
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        return None, f"invalid JSON: {exc}"
+    if not isinstance(parsed, dict):
+        return None, "remote response was not a JSON object"
+    return parsed, None
+
+
+def _proxy_remote_assistant(path: str, payload: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    if not REMOTE_ASSISTANT_BASE_URL:
+        return None, None
+    return _post_remote_json(f"{REMOTE_ASSISTANT_BASE_URL}{path}", payload, REMOTE_ASSISTANT_TIMEOUT_SEC)
+
+
+def _proxy_remote_assistant_get(path: str) -> tuple[dict[str, Any] | None, str | None]:
+    if not REMOTE_ASSISTANT_BASE_URL:
+        return None, None
+    return _get_remote_json(f"{REMOTE_ASSISTANT_BASE_URL}{path}", REMOTE_ASSISTANT_TIMEOUT_SEC)
+
+
+def _build_voices_payload() -> dict[str, Any]:
+    ollama_models = _list_ollama_model_ids()
+    payload: dict[str, Any] = {
+        "ok": True,
+        "voice_dir": str(PIPER_VOICE_DIR),
+        "default_backend": _normalize_tts_backend(DEFAULT_TTS_BACKEND),
+        "default_llm_backend": _normalize_llm_backend(DEFAULT_LLM_BACKEND),
+        "default_voice": DEFAULT_PIPER_VOICE,
+        "voices": _list_piper_voice_ids(),
+        "llm_backends": [
+            {"id": "openai", "label": f"OpenAI ({OPENAI_MODEL})"},
+            {"id": "ollama", "label": f"Ollama ({OLLAMA_MODEL})"},
+        ],
+        "backends": [
+            {"id": "piper", "label": "Piper"},
+            {"id": "openai", "label": "OpenAI Voice"},
+            {"id": "apple", "label": "Apple System Voice"},
+            {"id": "kokoro", "label": "Kokoro"},
+        ],
+        "playback_targets": [
+            {"id": "browser", "label": "This Browser"},
+            {"id": "robot", "label": "Robot Speakers"},
+        ],
+        "piper": {
+            "default_voice": DEFAULT_PIPER_VOICE,
+            "voices": _list_piper_voice_ids(),
+            "default_rate": 1.0,
+            "default_noise_scale": DEFAULT_PIPER_NOISE_SCALE,
+            "default_noise_w": DEFAULT_PIPER_NOISE_W,
+            "default_sentence_silence": DEFAULT_PIPER_SENTENCE_SILENCE,
+            "voice_defaults": _list_piper_voice_defaults(),
+        },
+        "openai": {
+            "default_voice": OPENAI_TTS_DEFAULT_VOICE,
+            "model": OPENAI_TTS_MODEL,
+            "voices": list(OPENAI_TTS_VOICES),
+        },
+        "openai_llm": {
+            "default_model": OPENAI_MODEL,
+            "models": [OPENAI_MODEL],
+        },
+        "ollama": {
+            "default_model": OLLAMA_MODEL,
+            "api_url": OLLAMA_API_URL,
+            "models": ollama_models,
+        },
+        "apple": {
+            "default_voice": APPLE_TTS_DEFAULT_VOICE,
+            "voices": _list_apple_voice_ids(),
+            "default_rate": APPLE_TTS_DEFAULT_RATE,
+        },
+        "kokoro": {
+            "default_voice": KOKORO_DEFAULT_VOICE,
+            "voices": _list_kokoro_voice_ids(),
+        },
+        "tts_catalog_source": "local",
+    }
+    remote_catalog, remote_error = _fetch_remote_tts_catalog()
+    if remote_catalog:
+        payload["voice_dir"] = remote_catalog.get("voice_dir") or payload["voice_dir"]
+        payload["default_backend"] = remote_catalog.get("default_backend") or payload["default_backend"]
+        payload["default_voice"] = remote_catalog.get("default_voice") or payload["default_voice"]
+        payload["default_llm_backend"] = remote_catalog.get("default_llm_backend") or payload["default_llm_backend"]
+        payload["voices"] = remote_catalog.get("voices") or payload["voices"]
+        payload["backends"] = remote_catalog.get("backends") or payload["backends"]
+        payload["llm_backends"] = remote_catalog.get("llm_backends") or payload["llm_backends"]
+        payload["piper"] = remote_catalog.get("piper") or payload["piper"]
+        payload["openai"] = remote_catalog.get("openai") or payload["openai"]
+        payload["openai_llm"] = remote_catalog.get("openai_llm") or payload["openai_llm"]
+        payload["ollama"] = remote_catalog.get("ollama") or payload["ollama"]
+        payload["apple"] = remote_catalog.get("apple") or payload["apple"]
+        payload["kokoro"] = remote_catalog.get("kokoro") or payload["kokoro"]
+        payload["tts_catalog_source"] = "remote"
+        payload["tts_catalog_url"] = REMOTE_TTS_CATALOG_URL
+    elif remote_error:
+        payload["tts_catalog_error"] = remote_error
+        payload["tts_catalog_url"] = REMOTE_TTS_CATALOG_URL
+    return payload
+
+
+def _ollama_supports_thinking(model: str) -> bool:
+    model_id = (model or "").strip().lower()
+    return (
+        model_id.startswith("deepseek-r1")
+        or model_id.startswith("qwen3")
+        or model_id.startswith("gpt-oss")
+        or model_id.startswith("deepseek-v3.1")
+    )
 
 
 def _query_openai_response(
     api_key: str, prompt: str, system_prompt: str, model: str
-) -> tuple[str | None, str | None]:
+) -> tuple[str | None, str | None, str | None]:
     payload = {
         "model": model,
         "input": prompt,
@@ -1004,18 +2114,20 @@ def _query_openai_response(
             raw = resp.read().decode("utf-8")
     except urlerror.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="ignore")
-        return None, f"HTTP {exc.code}: {body}"
+        return None, f"HTTP {exc.code}: {body}", None
     except Exception as exc:
-        return None, str(exc)
+        return None, str(exc), None
 
     try:
         parsed = json.loads(raw)
     except Exception as exc:
-        return None, f"invalid OpenAI response: {exc}"
+        return None, f"invalid OpenAI response: {exc}", None
 
     text = parsed.get("output_text")
     if isinstance(text, str) and text.strip():
-        return text.strip(), None
+        sanitized = _sanitize_model_reply(text)
+        if sanitized:
+            return sanitized, None, None
 
     output = parsed.get("output")
     chunks: list[str] = []
@@ -1037,8 +2149,104 @@ def _query_openai_response(
 
     joined = "".join(chunks).strip()
     if joined:
-        return joined, None
-    return None, "no text found in OpenAI response"
+        sanitized = _sanitize_model_reply(joined)
+        if sanitized:
+            return sanitized, None, None
+    return None, "no text found in OpenAI response", None
+
+
+def _query_ollama_response(
+    prompt: str | None,
+    system_prompt: str,
+    model: str,
+    messages: list[dict[str, str]] | None = None,
+) -> tuple[str | None, str | None, str | None]:
+    message_list: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    if messages:
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role", "")).strip().lower()
+            content = str(item.get("content", "")).strip()
+            if role not in ("system", "user", "assistant") or not content:
+                continue
+            message_list.append({"role": role, "content": content})
+    elif isinstance(prompt, str) and prompt.strip():
+        message_list.append({"role": "user", "content": prompt})
+
+    payload = {
+        "model": model,
+        "stream": False,
+        "messages": message_list,
+    }
+    if _ollama_supports_thinking(model):
+        payload["think"] = True
+    req = urlrequest.Request(
+        OLLAMA_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Content-Type": "application/json"},
+    )
+
+    try:
+        with urlrequest.urlopen(req, timeout=OLLAMA_TIMEOUT_SEC) as resp:
+            raw = resp.read().decode("utf-8")
+    except urlerror.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        return None, f"HTTP {exc.code}: {body}", None
+    except Exception as exc:
+        return None, str(exc), None
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as exc:
+        return None, f"invalid Ollama response: {exc}", None
+
+    thinking_text: str | None = None
+    message = parsed.get("message")
+    if isinstance(message, dict):
+        thinking = message.get("thinking")
+        if isinstance(thinking, str) and thinking.strip():
+            thinking_text = _sanitize_model_thinking(thinking)
+        content = message.get("content")
+        if isinstance(content, str) and content.strip():
+            sanitized = _sanitize_model_reply(content)
+            if sanitized:
+                return sanitized, None, thinking_text
+
+    response = parsed.get("response")
+    if isinstance(response, str) and response.strip():
+        sanitized = _sanitize_model_reply(response)
+        if sanitized:
+            return sanitized, None, thinking_text
+    return None, "no text found in Ollama response", thinking_text
+
+
+def _list_ollama_model_ids() -> list[str]:
+    req = urlrequest.Request(OLLAMA_API_URL.rsplit("/api/chat", 1)[0] + "/api/tags", method="GET")
+    try:
+        with urlrequest.urlopen(req, timeout=5) as resp:
+            raw = resp.read().decode("utf-8")
+    except Exception:
+        return []
+
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return []
+
+    models = parsed.get("models")
+    if not isinstance(models, list):
+        return []
+
+    names: list[str] = []
+    for item in models:
+        if not isinstance(item, dict):
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and name.strip():
+            names.append(name.strip())
+    return names
 
 
 def _prepare_tts_text(text: str) -> str:
@@ -1053,6 +2261,49 @@ def _prepare_tts_text(text: str) -> str:
     cleaned = re.sub(r"^\s*[-*]\s+", "", cleaned, flags=re.MULTILINE)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned or (text or "").strip()
+
+
+def _speak_with_backend(
+    backend: str,
+    voice: str,
+    text: str,
+    playback_target: str,
+    piper_rate: float | None,
+    piper_noise_scale: float | None,
+    piper_noise_w: float | None,
+    piper_sentence_silence: float | None,
+    apple_rate: float | None,
+    api_key: str,
+) -> tuple[bool, str | None, str, str | None, str]:
+    normalized_backend = _normalize_tts_backend(backend)
+    voice_id = (voice or "").strip() or _default_voice_for_backend(normalized_backend)
+    if normalized_backend == "openai":
+        ok, error, resolved_voice_id, wav_bytes = _synthesize_with_openai(api_key, text, voice_id)
+        local_mode = "browser"
+    elif normalized_backend == "apple":
+        ok, error, resolved_voice_id, wav_bytes = _synthesize_with_apple(text, voice_id, apple_rate)
+        local_mode = "browser"
+    elif normalized_backend == "kokoro":
+        ok, error, resolved_voice_id, wav_bytes = _synthesize_with_kokoro(text, voice_id)
+        local_mode = "browser"
+    else:
+        ok, error, resolved_voice_id, wav_bytes = _synthesize_with_piper(
+            text,
+            voice_id,
+            requested_rate=piper_rate,
+            requested_noise_scale=piper_noise_scale,
+            requested_noise_w=piper_noise_w,
+            requested_sentence_silence=piper_sentence_silence,
+        )
+        local_mode = PIPER_PLAYBACK_MODE
+    if not ok or wav_bytes is None:
+        return False, error, resolved_voice_id, None, "none"
+    delivered, delivery_error, audio_b64, playback_mode = _deliver_wav_audio(
+        wav_bytes,
+        local_mode=local_mode,
+        playback_target=_normalize_playback_target(playback_target),
+    )
+    return delivered, delivery_error, resolved_voice_id, audio_b64, playback_mode
 
 
 def _supports_espeak_voice_failure(stderr_text: str) -> bool:
@@ -1098,6 +2349,48 @@ def _resolve_piper_voice(voice: str) -> tuple[Path | None, Path | None, str]:
     return None, None, voice_id
 
 
+def _read_piper_voice_defaults(config_path: Path) -> dict[str, float]:
+    defaults = {
+        "rate": 1.0,
+        "noise_scale": DEFAULT_PIPER_NOISE_SCALE,
+        "noise_w": DEFAULT_PIPER_NOISE_W,
+        "sentence_silence": DEFAULT_PIPER_SENTENCE_SILENCE,
+    }
+    try:
+        parsed = json.loads(config_path.read_text(encoding="utf-8"))
+    except Exception:
+        return defaults
+
+    inference = parsed.get("inference")
+    if not isinstance(inference, dict):
+        return defaults
+
+    length_scale = inference.get("length_scale")
+    if isinstance(length_scale, (int, float)) and float(length_scale) > 0:
+        defaults["rate"] = max(0.5, min(2.0, 1.0 / float(length_scale)))
+
+    noise_scale = inference.get("noise_scale")
+    if isinstance(noise_scale, (int, float)):
+        defaults["noise_scale"] = max(0.1, min(2.0, float(noise_scale)))
+
+    noise_w = inference.get("noise_w")
+    if isinstance(noise_w, (int, float)):
+        defaults["noise_w"] = max(0.1, min(2.0, float(noise_w)))
+
+    return defaults
+
+
+def _list_piper_voice_defaults() -> dict[str, dict[str, float]]:
+    defaults: dict[str, dict[str, float]] = {}
+    for voice_id in _list_piper_voice_ids():
+        _model, config, resolved_voice_id = _resolve_piper_voice(voice_id)
+        if config is None:
+            continue
+        defaults[resolved_voice_id] = _read_piper_voice_defaults(config)
+    return defaults
+    return None, None, voice_id
+
+
 def _read_sample_rate_from_piper_config(config_path: Path) -> int:
     try:
         payload = json.loads(config_path.read_text(encoding="utf-8"))
@@ -1110,23 +2403,171 @@ def _read_sample_rate_from_piper_config(config_path: Path) -> int:
     return 22050
 
 
-def _speak_with_piper(text: str, voice: str) -> tuple[bool, str | None, str, str | None, str]:
+def _resolve_piper_length_scale(requested_rate: float | None) -> float | None:
+    base_length_scale: float | None = None
+    if PIPER_LENGTH_SCALE:
+        try:
+            parsed = float(PIPER_LENGTH_SCALE)
+            if parsed > 0:
+                base_length_scale = parsed
+        except Exception:
+            base_length_scale = None
+    if requested_rate is None:
+        return base_length_scale
+    try:
+        rate = float(requested_rate)
+    except Exception:
+        return base_length_scale
+    if rate <= 0:
+        return base_length_scale
+    effective = (base_length_scale or 1.0) / rate
+    return min(3.0, max(0.25, effective))
+
+
+def _apple_tts_ready_state() -> tuple[bool, str | None]:
+    if sys.platform != "darwin":
+        return False, "Apple TTS is only available on macOS"
+    if not shutil.which("say"):
+        return False, "say command not found"
+    if not shutil.which("afconvert"):
+        return False, "afconvert command not found"
+    return True, None
+
+
+def _kokoro_voice_lang_code(voice: str) -> str:
+    voice_id = (voice or "").strip().lower()
+    if len(voice_id) >= 1:
+        prefix = voice_id[0]
+        if prefix in ("a", "b", "e", "f", "h", "i", "j", "p", "z"):
+            return prefix
+    return "a"
+
+
+def _kokoro_ready_state() -> tuple[bool, str | None]:
+    try:
+        import importlib.util
+
+        if importlib.util.find_spec("kokoro") is None:
+            return False, "kokoro package not installed"
+    except Exception as exc:
+        return False, str(exc)
+    return True, None
+
+
+def _list_kokoro_voice_ids() -> list[str]:
+    try:
+        from huggingface_hub import list_repo_files  # type: ignore
+
+        files = list_repo_files(KOKORO_REPO_ID)
+        voices = sorted(
+            {
+                file_path.split("/")[-1][:-3]
+                for file_path in files
+                if file_path.startswith("voices/") and file_path.endswith(".pt")
+            }
+        )
+        return voices or DEFAULT_KOKORO_VOICES
+    except Exception:
+        return list(DEFAULT_KOKORO_VOICES)
+
+
+def _get_kokoro_pipeline(lang_code: str) -> Any:
+    with KOKORO_PIPELINE_LOCK:
+        cached = KOKORO_PIPELINE_CACHE.get(lang_code)
+        if cached is not None:
+            return cached
+        from kokoro import KPipeline  # type: ignore
+
+        pipeline = KPipeline(lang_code=lang_code, repo_id=KOKORO_REPO_ID)
+        KOKORO_PIPELINE_CACHE[lang_code] = pipeline
+        return pipeline
+
+
+def _float_audio_to_wav_bytes(audio: Any, sample_rate: int) -> bytes:
+    import numpy as np  # type: ignore
+
+    samples = audio.detach().cpu().numpy() if hasattr(audio, "detach") else np.asarray(audio)
+    clipped = np.clip(samples, -1.0, 1.0)
+    pcm = (clipped * 32767.0).astype(np.int16)
+    out = io.BytesIO()
+    with wave.open(out, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm.tobytes())
+    return out.getvalue()
+
+
+def _list_apple_voice_ids() -> list[str]:
+    ready, _ = _apple_tts_ready_state()
+    if not ready:
+        return []
+    try:
+        proc = subprocess.run(
+            ["say", "-v", "?"],
+            capture_output=True,
+            timeout=5,
+            check=False,
+            text=True,
+        )
+    except Exception:
+        return []
+    if proc.returncode != 0:
+        return []
+    voices: list[str] = []
+    for raw in (proc.stdout or "").splitlines():
+        line = raw.rstrip()
+        if not line:
+            continue
+        match = re.match(r"^\s*([^\s].*?\S)\s{2,}", line)
+        if not match:
+            continue
+        voice_id = match.group(1).strip()
+        if voice_id:
+            voices.append(voice_id)
+    return voices
+
+
+def _resolve_apple_words_per_minute(requested_rate: float | None) -> int:
+    base_rate = APPLE_TTS_DEFAULT_RATE if APPLE_TTS_DEFAULT_RATE > 0 else 1.0
+    try:
+        rate = float(requested_rate) if requested_rate is not None else base_rate
+    except Exception:
+        rate = base_rate
+    rate = min(2.0, max(0.5, rate))
+    return max(90, min(360, int(round(175 * rate))))
+
+
+def _synthesize_with_piper(
+    text: str,
+    voice: str,
+    requested_rate: float | None = None,
+    requested_noise_scale: float | None = None,
+    requested_noise_w: float | None = None,
+    requested_sentence_silence: float | None = None,
+) -> tuple[bool, str | None, str, bytes | None]:
     ready, ready_err = _piper_ready_state()
     if not ready:
-        return False, ready_err, voice, None, "none"
+        return False, ready_err, voice, None
 
     model, config, voice_id = _resolve_piper_voice(voice)
     if model is None or config is None:
-        return False, f"piper voice not found: {voice_id}", voice_id, None, "none"
+        return False, f"piper voice not found: {voice_id}", voice_id, None
 
     piper_cmd_base = [str(PIPER_BIN), "--model", str(model), "--config", str(config)]
-    if PIPER_LENGTH_SCALE:
-        try:
-            length_scale = float(PIPER_LENGTH_SCALE)
-            if length_scale > 0:
-                piper_cmd_base.extend(["--length_scale", str(length_scale)])
-        except Exception:
-            pass
+    length_scale = _resolve_piper_length_scale(requested_rate)
+    if length_scale is not None:
+        piper_cmd_base.extend(["--length_scale", str(length_scale)])
+    noise_scale = requested_noise_scale if requested_noise_scale is not None else DEFAULT_PIPER_NOISE_SCALE
+    noise_w = requested_noise_w if requested_noise_w is not None else DEFAULT_PIPER_NOISE_W
+    sentence_silence = (
+        requested_sentence_silence
+        if requested_sentence_silence is not None
+        else DEFAULT_PIPER_SENTENCE_SILENCE
+    )
+    piper_cmd_base.extend(["--noise_scale", str(noise_scale)])
+    piper_cmd_base.extend(["--noise_w", str(noise_w)])
+    piper_cmd_base.extend(["--sentence_silence", str(sentence_silence)])
     if PIPER_ESPEAK_VOICE:
         piper_cmd_base.extend(["--espeak_voice", PIPER_ESPEAK_VOICE])
     try:
@@ -1143,13 +2584,11 @@ def _speak_with_piper(text: str, voice: str) -> tuple[bool, str | None, str, str
             piper_stderr = (piper_proc.stderr or b"").decode("utf-8", errors="ignore")
             if piper_proc.returncode != 0 and PIPER_ESPEAK_VOICE and _supports_espeak_voice_failure(piper_stderr):
                 fallback_cmd = [str(PIPER_BIN), "--model", str(model), "--config", str(config)]
-                if PIPER_LENGTH_SCALE:
-                    try:
-                        length_scale = float(PIPER_LENGTH_SCALE)
-                        if length_scale > 0:
-                            fallback_cmd.extend(["--length_scale", str(length_scale)])
-                    except Exception:
-                        pass
+                if length_scale is not None:
+                    fallback_cmd.extend(["--length_scale", str(length_scale)])
+                fallback_cmd.extend(["--noise_scale", str(noise_scale)])
+                fallback_cmd.extend(["--noise_w", str(noise_w)])
+                fallback_cmd.extend(["--sentence_silence", str(sentence_silence)])
                 fallback_cmd.extend(["--output_file", wav_file.name])
                 _debug_log("piper --espeak_voice unsupported; retrying without it")
                 _debug_log(f"$ {' '.join(shlex.quote(p) for p in fallback_cmd)}")
@@ -1162,63 +2601,237 @@ def _speak_with_piper(text: str, voice: str) -> tuple[bool, str | None, str, str
                 )
                 piper_stderr = (piper_proc.stderr or b"").decode("utf-8", errors="ignore")
             if piper_proc.returncode != 0:
-                return False, piper_stderr.strip() or f"piper rc={piper_proc.returncode}", voice_id, None, "none"
+                return False, piper_stderr.strip() or f"piper rc={piper_proc.returncode}", voice_id, None
 
             wav_bytes = Path(wav_file.name).read_bytes()
             if not wav_bytes:
-                return False, "piper produced empty audio", voice_id, None, "none"
+                return False, "piper produced empty audio", voice_id, None
+            return True, None, voice_id, wav_bytes
+    except Exception as exc:
+        return False, str(exc), voice_id, None
 
-            mode = PIPER_PLAYBACK_MODE
-            if mode not in ("auto", "aplay", "afplay", "browser"):
-                mode = "auto"
 
+def _synthesize_with_openai(api_key: str, text: str, voice: str) -> tuple[bool, str | None, str, bytes | None]:
+    voice_id = voice.strip() or OPENAI_TTS_DEFAULT_VOICE
+    payload = {
+        "model": OPENAI_TTS_MODEL,
+        "input": text,
+        "voice": voice_id,
+        "response_format": "wav",
+    }
+    req = urlrequest.Request(
+        OPENAI_TTS_API_URL,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        },
+    )
+
+    ca_bundle = os.environ.get("OPENAI_CA_BUNDLE", "").strip()
+    ssl_ctx = None
+    if ca_bundle:
+        ssl_ctx = ssl.create_default_context(cafile=ca_bundle)
+    else:
+        try:
+            import certifi  # type: ignore
+
+            ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            ssl_ctx = ssl.create_default_context()
+
+    try:
+        with urlrequest.urlopen(req, timeout=OPENAI_TIMEOUT_SEC, context=ssl_ctx) as resp:
+            wav_bytes = resp.read()
+    except urlerror.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="ignore")
+        return False, f"HTTP {exc.code}: {body}", voice_id, None
+    except Exception as exc:
+        return False, str(exc), voice_id, None
+
+    if not wav_bytes:
+        return False, "OpenAI TTS returned empty audio", voice_id, None
+
+    return True, None, voice_id, wav_bytes
+
+
+def _synthesize_with_apple(text: str, voice: str, requested_rate: float | None = None) -> tuple[bool, str | None, str, bytes | None]:
+    ready, ready_err = _apple_tts_ready_state()
+    voice_id = voice.strip() or APPLE_TTS_DEFAULT_VOICE
+    if not ready:
+        return False, ready_err, voice_id, None
+    try:
+        with tempfile.TemporaryDirectory(prefix="apple_tts_") as temp_dir:
+            temp_path = Path(temp_dir)
+            aiff_path = temp_path / "speech.aiff"
+            wav_path = temp_path / "speech.wav"
+            say_cmd = ["say", "-v", voice_id, "-r", str(_resolve_apple_words_per_minute(requested_rate)), "-o", str(aiff_path), text]
+            _debug_log(f"$ {' '.join(shlex.quote(p) for p in say_cmd)}")
+            say_proc = subprocess.run(
+                say_cmd,
+                capture_output=True,
+                timeout=30,
+                check=False,
+                text=True,
+            )
+            if say_proc.returncode != 0:
+                return False, (say_proc.stderr or say_proc.stdout or "").strip() or f"say rc={say_proc.returncode}", voice_id, None
+            convert_cmd = ["afconvert", "-f", "WAVE", "-d", "LEI16@22050", str(aiff_path), str(wav_path)]
+            _debug_log(f"$ {' '.join(shlex.quote(p) for p in convert_cmd)}")
+            convert_proc = subprocess.run(
+                convert_cmd,
+                capture_output=True,
+                timeout=30,
+                check=False,
+                text=True,
+            )
+            if convert_proc.returncode != 0:
+                return (
+                    False,
+                    (convert_proc.stderr or convert_proc.stdout or "").strip() or f"afconvert rc={convert_proc.returncode}",
+                    voice_id,
+                    None,
+                )
+            wav_bytes = wav_path.read_bytes()
+            if not wav_bytes:
+                return False, "Apple TTS produced empty audio", voice_id, None
+            return True, None, voice_id, wav_bytes
+    except Exception as exc:
+        return False, str(exc), voice_id, None
+
+
+def _synthesize_with_kokoro(text: str, voice: str) -> tuple[bool, str | None, str, bytes | None]:
+    ready, ready_err = _kokoro_ready_state()
+    voice_id = voice.strip() or KOKORO_DEFAULT_VOICE
+    if not ready:
+        return False, ready_err, voice_id, None
+    lang_code = _kokoro_voice_lang_code(voice_id)
+    try:
+        pipeline = _get_kokoro_pipeline(lang_code)
+        wav_chunks: list[bytes] = []
+        for result in pipeline(text, voice=voice_id, speed=1.0, split_pattern=r"\n+"):
+            audio = getattr(result, "audio", None)
+            if audio is None:
+                continue
+            wav_chunks.append(_float_audio_to_wav_bytes(audio, sample_rate=24000))
+        if not wav_chunks:
+            return False, "Kokoro produced empty audio", voice_id, None
+        if len(wav_chunks) == 1:
+            return True, None, voice_id, wav_chunks[0]
+        merged = io.BytesIO()
+        with wave.open(merged, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(24000)
+            for chunk in wav_chunks:
+                with wave.open(io.BytesIO(chunk), "rb") as source:
+                    wav_file.writeframes(source.readframes(source.getnframes()))
+        return True, None, voice_id, merged.getvalue()
+    except Exception as exc:
+        return False, str(exc), voice_id, None
+
+
+def _play_wav_locally(wav_bytes: bytes, local_mode: str) -> tuple[bool, str | None, str | None, str]:
+    mode = (local_mode or "browser").strip().lower()
+    if mode not in ("auto", "aplay", "afplay", "browser"):
+        mode = "browser"
+    try:
+        with tempfile.NamedTemporaryFile(prefix="speech_", suffix=".wav", delete=True) as wav_file:
+            wav_file.write(wav_bytes)
+            wav_file.flush()
             if mode in ("auto", "aplay"):
                 if shutil.which("aplay"):
                     aplay_cmd = ["aplay", "-q", "-D", PIPER_APLAY_DEVICE, wav_file.name]
                     _debug_log(f"$ {' '.join(shlex.quote(p) for p in aplay_cmd)}")
-                    aplay_proc = subprocess.run(
-                        aplay_cmd,
-                        capture_output=True,
-                        timeout=25,
-                        check=False,
-                    )
+                    aplay_proc = subprocess.run(aplay_cmd, capture_output=True, timeout=25, check=False)
                     aplay_stderr = (aplay_proc.stderr or b"").decode("utf-8", errors="ignore")
                     if aplay_proc.returncode == 0:
-                        return True, None, voice_id, None, "aplay"
+                        return True, None, None, "aplay"
                     if mode == "aplay":
-                        return False, aplay_stderr.strip() or f"aplay rc={aplay_proc.returncode}", voice_id, None, "aplay"
+                        return False, aplay_stderr.strip() or f"aplay rc={aplay_proc.returncode}", None, "aplay"
                     _debug_log("aplay failed, falling back to browser audio playback")
                 elif mode == "aplay":
-                    return False, "aplay not found", voice_id, None, "aplay"
-
+                    return False, "aplay not found", None, "aplay"
             if mode in ("auto", "afplay"):
                 if shutil.which("afplay"):
                     afplay_cmd = ["afplay", wav_file.name]
                     _debug_log(f"$ {' '.join(shlex.quote(p) for p in afplay_cmd)}")
-                    afplay_proc = subprocess.run(
-                        afplay_cmd,
-                        capture_output=True,
-                        timeout=25,
-                        check=False,
-                    )
+                    afplay_proc = subprocess.run(afplay_cmd, capture_output=True, timeout=25, check=False)
                     afplay_stderr = (afplay_proc.stderr or b"").decode("utf-8", errors="ignore")
                     if afplay_proc.returncode == 0:
-                        return True, None, voice_id, None, "afplay"
+                        return True, None, None, "afplay"
                     if mode == "afplay":
-                        return (
-                            False,
-                            afplay_stderr.strip() or f"afplay rc={afplay_proc.returncode}",
-                            voice_id,
-                            None,
-                            "afplay",
-                        )
+                        return False, afplay_stderr.strip() or f"afplay rc={afplay_proc.returncode}", None, "afplay"
                     _debug_log("afplay failed, falling back to browser audio playback")
                 elif mode == "afplay":
-                    return False, "afplay not found", voice_id, None, "afplay"
-
-            return True, None, voice_id, base64.b64encode(wav_bytes).decode("ascii"), "browser"
+                    return False, "afplay not found", None, "afplay"
+            return True, None, base64.b64encode(wav_bytes).decode("ascii"), "browser"
     except Exception as exc:
-        return False, str(exc), voice_id, None, "none"
+        return False, str(exc), None, "none"
+
+
+def _play_wav_on_robot_blocking(wav_bytes: bytes) -> tuple[bool, str | None, str]:
+    ssh_target = f"{ROBOT_AUDIO_SSH_USER}@{ROBOT_AUDIO_SSH_HOST}"
+    remote_file = f"{ROBOT_AUDIO_DIR.rstrip('/')}/speech_{int(time.time() * 1000)}.wav"
+    try:
+        with tempfile.NamedTemporaryFile(prefix="robot_speech_", suffix=".wav", delete=True) as wav_file:
+            wav_file.write(wav_bytes)
+            wav_file.flush()
+            mkdir_cmd = [
+                "ssh",
+                "-p",
+                str(ROBOT_AUDIO_SSH_PORT),
+                ssh_target,
+                f"mkdir -p {shlex.quote(ROBOT_AUDIO_DIR)}",
+            ]
+            _debug_log(f"$ {' '.join(shlex.quote(p) for p in mkdir_cmd)}")
+            mkdir_proc = subprocess.run(mkdir_cmd, capture_output=True, timeout=15, check=False, text=True)
+            if mkdir_proc.returncode != 0:
+                return False, (mkdir_proc.stderr or mkdir_proc.stdout or "").strip() or f"ssh rc={mkdir_proc.returncode}", "robot"
+            scp_cmd = [
+                "scp",
+                "-P",
+                str(ROBOT_AUDIO_SSH_PORT),
+                wav_file.name,
+                f"{ssh_target}:{remote_file}",
+            ]
+            _debug_log(f"$ {' '.join(shlex.quote(p) for p in scp_cmd)}")
+            scp_proc = subprocess.run(scp_cmd, capture_output=True, timeout=20, check=False, text=True)
+            if scp_proc.returncode != 0:
+                return False, (scp_proc.stderr or scp_proc.stdout or "").strip() or f"scp rc={scp_proc.returncode}", "robot"
+            remote_cmd = (
+                f"aplay -q -D {shlex.quote(ROBOT_AUDIO_APLAY_DEVICE)} {shlex.quote(remote_file)}"
+                f" && rm -f {shlex.quote(remote_file)}"
+            )
+            ssh_cmd = ["ssh", "-p", str(ROBOT_AUDIO_SSH_PORT), ssh_target, remote_cmd]
+            _debug_log(f"$ {' '.join(shlex.quote(p) for p in ssh_cmd)}")
+            ssh_proc = subprocess.run(ssh_cmd, capture_output=True, timeout=45, check=False, text=True)
+            if ssh_proc.returncode != 0:
+                return False, (ssh_proc.stderr or ssh_proc.stdout or "").strip() or f"ssh rc={ssh_proc.returncode}", "robot"
+            return True, None, "robot"
+    except Exception as exc:
+        return False, str(exc), "robot"
+
+
+def _play_wav_on_robot(wav_bytes: bytes) -> tuple[bool, str | None, str]:
+    def _worker(audio_bytes: bytes) -> None:
+        ok, error, _mode = _play_wav_on_robot_blocking(audio_bytes)
+        if not ok and error:
+            _debug_log(f"robot playback failed: {error}")
+
+    try:
+        threading.Thread(target=_worker, args=(bytes(wav_bytes),), daemon=True).start()
+        return True, None, "robot"
+    except Exception as exc:
+        return False, str(exc), "robot"
+
+
+def _deliver_wav_audio(wav_bytes: bytes, local_mode: str, playback_target: str) -> tuple[bool, str | None, str | None, str]:
+    if playback_target == "robot":
+        ok, error, playback_mode = _play_wav_on_robot(wav_bytes)
+        return ok, error, None, playback_mode
+    return _play_wav_locally(wav_bytes, local_mode)
 
 
 def _parse_volume_percent(output: str) -> int | None:
@@ -1236,29 +2849,78 @@ def _parse_volume_percent(output: str) -> int | None:
     return int(round(sum(values) / len(values)))
 
 
+def _parse_plain_percent(output: str) -> int | None:
+    text = (output or "").strip()
+    if not text or text == "missing value":
+        return None
+    match = re.search(r"\b([0-9]{1,3})\b", text)
+    if not match:
+        return None
+    try:
+        return max(0, min(100, int(match.group(1))))
+    except Exception:
+        return None
+
+
+def _parse_macos_volume_settings(output: str) -> int | None:
+    text = (output or "").strip()
+    if not text:
+        return None
+    match = re.search(r"output volume:([0-9]{1,3}|missing value)", text)
+    if not match:
+        return None
+    token = match.group(1)
+    if token == "missing value":
+        return None
+    try:
+        return max(0, min(100, int(token)))
+    except Exception:
+        return None
+
+
 def _read_volume_percent() -> tuple[int | None, str]:
     commands: list[tuple[str, str]] = []
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        commands.append(("osascript:output", "osascript -e 'output volume of (get volume settings)'"))
+        commands.append(("osascript:settings", "osascript -e 'get volume settings'"))
     if shutil.which("amixer"):
         commands.append(("amixer:pulse", "amixer -D pulse sget Master"))
         commands.append(("amixer:default", "amixer sget Master"))
     if shutil.which("pactl"):
         commands.append(("pactl:default", "pactl get-sink-volume @DEFAULT_SINK@"))
     if not commands:
+        if LAST_SET_VOLUME_PERCENT is not None:
+            return LAST_SET_VOLUME_PERCENT, "cache:last_set"
         return None, "unavailable"
 
     for source, cmd in commands:
         rc, out = _run_shell(cmd, timeout_sec=3, log_command=False, log_output=False)
         if rc != 0:
             continue
+        if source.startswith("osascript:"):
+            pct = _parse_plain_percent(out) if source == "osascript:output" else _parse_macos_volume_settings(out)
+            if pct is not None:
+                return pct, source
+            if source == "osascript:settings":
+                muted_match = re.search(r"output muted:(true|false)", out)
+                if muted_match and muted_match.group(1) == "true":
+                    return 0, source
+            continue
         pct = _parse_volume_percent(out)
         if pct is not None:
             return pct, source
+    if LAST_SET_VOLUME_PERCENT is not None:
+        return LAST_SET_VOLUME_PERCENT, "cache:last_set"
     return None, "unavailable"
 
 
 def _set_volume_percent(percent: int) -> tuple[bool, str, str | None]:
+    global LAST_SET_VOLUME_PERCENT
     pct = max(0, min(100, int(percent)))
-    commands: list[tuple[str, str]] = [
+    commands: list[tuple[str, str]] = []
+    if sys.platform == "darwin" and shutil.which("osascript"):
+        commands.append(("osascript:output", "osascript -e 'set volume output volume " + str(pct) + "'"))
+    commands.append(
         (
             "bashrc:vol",
             "source ~/.bashrc >/dev/null 2>&1 || true; "
@@ -1266,7 +2928,7 @@ def _set_volume_percent(percent: int) -> tuple[bool, str, str | None]:
             + str(pct)
             + "; else exit 127; fi",
         )
-    ]
+    )
     if shutil.which("amixer"):
         commands.append(("amixer:pulse", "amixer -D pulse sset Master " + str(pct) + "%"))
     if shutil.which("pactl"):
@@ -1276,6 +2938,7 @@ def _set_volume_percent(percent: int) -> tuple[bool, str, str | None]:
     for source, cmd in commands:
         rc, out = _run_shell(cmd, timeout_sec=4, log_command=False, log_output=False)
         if rc == 0:
+            LAST_SET_VOLUME_PERCENT = pct
             return True, source, None
         last_error = out.strip() or f"rc={rc}"
     return False, "unavailable", last_error
